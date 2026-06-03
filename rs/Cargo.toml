@@ -1,0 +1,26 @@
+[package]
+name = "probe-rs"
+version = "0.1.0"
+edition = "2021"
+description = "Single-pass incident-evidence engine: a Rust port of the Python probe engine."
+license = "MIT"
+
+[[bin]]
+name = "probe-rs"
+path = "src/bin/probe-rs.rs"
+
+[lib]
+name = "probe_rs"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+flate2 = "1"
+sha2 = "0.10"
+regex = "1"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1

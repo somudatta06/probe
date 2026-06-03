@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "probe-logs"
+version = "0.1.0"
+description = "Local-first incident-evidence engine for AI agents: huge logs -> a small ranked capsule + a lossless, seekable index the agent can drill into."
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "FSL-1.1-Apache-2.0" }
+authors = [{ name = "probe" }]
+keywords = ["logs", "observability", "incident", "mcp", "ai-agents", "sre", "clp", "drain"]
+dependencies = []  # stdlib only — zero runtime deps
+
+[project.urls]
+Homepage = "https://github.com/your-org/probe"
+
+[project.scripts]
+probe = "probe.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["probe*"]
