@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Convenience launcher: `bin/probe selftest`, `bin/probe mcp`, etc.
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+exec env PYTHONPATH="$DIR" python3 -m probe.cli "$@"
