@@ -23,13 +23,15 @@ from . import redact as _redact
 from . import clp as _clp
 
 # ----------------------------------------------------------------------------- masking / parsing
-_MASKS = [
-    (re.compile(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b"), "<ip>"),
-    (re.compile(r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b"), "<uuid>"),
-    (re.compile(r"\b0x[0-9a-fA-F]+\b"), "<hex>"),
-    (re.compile(r"\b[0-9a-fA-F]{12,}\b"), "<hex>"),
-    (re.compile(r"\b\d+\b"), "<num>"),
-]
+# One single-pass alternation instead of five sequential sub() passes (same result
+# for these non-overlapping patterns; ~5x fewer regex traversals — a build hot spot).
+_MASK_RE = re.compile(
+    r"(?P<ip>\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b)"
+    r"|(?P<uuid>\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b)"
+    r"|(?P<hx>\b0x[0-9a-fA-F]+\b|\b[0-9a-fA-F]{12,}\b)"
+    r"|(?P<num>\b\d+\b)"
+)
+_MASK_REP = {"ip": "<ip>", "uuid": "<uuid>", "hx": "<hex>", "num": "<num>"}
 # A line CONTINUES the previous record (vs starting a new one) only if it looks
 # like a continuation: indented, or a stack-trace marker. Format-agnostic — works
 # on HDFS/syslog/OpenStack/JSON, not just ISO-8601 — while keeping traces atomic.
@@ -43,9 +45,26 @@ DEFAULT_WEIGHTS = {"anomaly": 0.40, "severity": 0.25, "proximity": 0.20, "rarity
 
 
 def mask(s):
-    for pat, rep in _MASKS:
-        s = pat.sub(rep, s)
-    return s
+    return _MASK_RE.sub(lambda m: _MASK_REP[m.lastgroup], s)
+
+
+def _parse_body(body):
+    """One pass over a line body -> (typed-masked key string, sentinel logtype, [vars]).
+    Uses the same matches as mask() and clp._VAR, so the clustering key and the store
+    encoding are identical to computing them separately — but in a single scan."""
+    masked, logtype, vrs, last = [], [], [], 0
+    for m in _MASK_RE.finditer(body):
+        seg = body[last:m.start()]
+        masked.append(seg)
+        masked.append(_MASK_REP[m.lastgroup])
+        logtype.append(seg)
+        logtype.append(_clp.SENT)
+        vrs.append(m.group(0))
+        last = m.end()
+    tail = body[last:]
+    masked.append(tail)
+    logtype.append(tail)
+    return "".join(masked), "".join(logtype), vrs
 
 
 def render(tokens):
@@ -69,16 +88,24 @@ def to_records(raw_lines, service=""):
         else:
             records.append({"start": ln, "end": ln, "lines": [text]})
     for r in records:
-        joined = "\n".join(r["lines"])
-        first = r["lines"][0]
-        body = _clp.TS_PREFIX.sub("", first)
-        m = _LEVEL.search(joined)
-        r["level"] = m.group(1) if m else "INFO"
+        lines = r["lines"]
+        first = lines[0]
+        joined = first if len(lines) == 1 else "\n".join(lines)
+        tm = _clp.TS_PREFIX.match(first)
+        ts_raw = first[: tm.end()] if tm else ""
+        body = first[len(ts_raw):]
+        lm = _LEVEL.search(joined)
+        r["level"] = lm.group(1) if lm else "INFO"
         r["sev"] = _SEV.get(r["level"], 0.2)
         r["traces"] = list(dict.fromkeys(_TRACE.findall(joined)))
         r["raw"] = joined
-        r["ts"] = first[: len(first) - len(body)].strip()
-        r["key"] = mask(body).split()
+        r["ts"] = ts_raw.strip()
+        key_str, lt, vrs = _parse_body(body)
+        r["key"] = key_str.split()
+        # Single-line records (the common case) reuse this one pass for the store,
+        # skipping a second clp.encode scan. Multiline records are encoded from raw later.
+        if len(lines) == 1 and _clp.SENT not in body:
+            r["clp"] = (ts_raw, lt, vrs)
         r["service"] = service
     return records
 
@@ -353,24 +380,42 @@ def _write_capture(cache_dir, h, raw_bytes, records, clusters, traces_index, cap
     # gzip blocks. Drill-down decodes only the blocks it touches.
     lt_id, logtypes, rows = {}, [], []
     for r in records:
-        ts, lt, vrs = _clp.encode(r["raw"])
+        ts, lt, vrs = r["clp"] if "clp" in r else _clp.encode(r["raw"])
         if lt not in lt_id:
             lt_id[lt] = len(logtypes)
             logtypes.append(lt)
         rows.append((ts, lt_id[lt], vrs))
     blocks = _clp.write_store(os.path.join(d, "store.clp"), rows, logtypes)
 
-    meta = {
-        "n_lines": capsule["window"]["lines"],
-        "records": [[r["start"] + 1, r["end"] + 1, r["cid"], r["level"], r.get("service", "")] for r in records],
-        "clusters": [{"id": c["id"], "template": render(c["tok"]), "count": c["count"],
-                      "level": c["level"], "recs": c["recs"]} for c in clusters],
-        "traces": dict(traces_index),
-        "logtypes": logtypes,
-        "blocks": blocks,
-    }
+    clusters_meta = [{"id": c["id"], "template": render(c["tok"]), "count": c["count"],
+                      "level": c["level"]} for c in clusters]
+    # Stream the two O(n) arrays (records, traces) by hand instead of json.dump's
+    # per-element Python dispatch — the build hot spot at scale. level is a fixed
+    # keyword and service / trace ids are [A-Za-z0-9_-]+, so no escaping is needed.
+    # level is a fixed keyword, but service is user-supplied — JSON-escape both.
+    # Cached so json.dumps runs once per distinct value, not per record.
+    _esc = {}
+
+    def _e(s):
+        v = _esc.get(s)
+        if v is None:
+            v = _esc[s] = json.dumps(s)
+        return v
+
     with open(os.path.join(d, "meta.json"), "w") as f:
-        json.dump(meta, f)
+        f.write('{"n_lines":%d,"records":[' % capsule["window"]["lines"])
+        f.write(",".join('[%d,%d,%d,%s,%s]'
+                         % (r["start"] + 1, r["end"] + 1, r["cid"], _e(r["level"]), _e(r.get("service", "")))
+                         for r in records))
+        f.write('],"clusters":')
+        json.dump(clusters_meta, f)
+        f.write(',"traces":{')
+        f.write(",".join('"%s":[%s]' % (t, ",".join(map(str, idxs))) for t, idxs in traces_index.items()))
+        f.write('},"logtypes":')
+        json.dump(logtypes, f)
+        f.write(',"blocks":')
+        json.dump(blocks, f)
+        f.write("}")
     with open(os.path.join(d, "capsule.json"), "w") as f:
         json.dump(capsule, f, indent=2)
 
@@ -450,11 +495,15 @@ class Loader:
         cid = int(str(fact_id).lstrip("F"))
         c = self.meta["clusters"][cid]
         cap = next((f for f in self.capsule["evidence"] if f["fact_id"] == fact_id), None)
-        samples = []
-        for ridx in c["recs"][:5]:
-            s, e, _, _, _ = self._rec(self.meta["records"][ridx])
-            samples.append({"line": s, "text": self._text(s, e)})
-        recomputed = len(c["recs"])
+        # Re-derive the count + sample lines by scanning the stored record index
+        # (the cluster->records list is no longer persisted; this keeps meta O(1) per cluster).
+        recomputed, samples = 0, []
+        for row in self.meta["records"]:
+            if row[2] == cid:
+                recomputed += 1
+                if len(samples) < 5:
+                    s, e, _, _, _ = self._rec(row)
+                    samples.append({"line": s, "text": self._text(s, e)})
         return {"fact_id": fact_id, "template": c["template"], "recomputed_count": recomputed,
                 "capsule_count": (cap or {}).get("count"),
                 "matches": (cap or {}).get("count") == recomputed, "samples": samples}

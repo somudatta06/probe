@@ -916,7 +916,7 @@ fn write_capture(cache_dir: &str, h: &str, records: &[Record], clusters: &[Clust
         });
         rows.push((ts, id, vars));
     }
-    let blocks = clp::write_store(&format!("{}/store.clp", dir), &rows, 8192);
+    let blocks = clp::write_store(&format!("{}/store.clp", dir), &rows, &logtypes, 16384);
 
     let records_json: Vec<Value> = records
         .iter()

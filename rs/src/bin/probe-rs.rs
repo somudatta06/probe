@@ -224,6 +224,11 @@ fn build_cmd(args: &[String]) {
         eprintln!("cannot read {}: {}", file, e);
         exit(1);
     });
-    let (capsule, _id) = build(&raw_bytes, budget);
+    // --cache DIR persists a capture (store + meta + capsule) the Python Loader reads.
+    let (capsule, id) = match arg_value(args, "--cache") {
+        Some(dir) => build_capture(&raw_bytes, budget, &dir),
+        None => build(&raw_bytes, budget),
+    };
     println!("{}", serde_json::to_string_pretty(&capsule).unwrap());
+    eprintln!("capture_id: {}", id);
 }

@@ -5,10 +5,26 @@ retrieval: it reads the cheap capsule first, then expands / searches / verifies
 against the local capture only as its hypothesis demands. No data leaves the box
 beyond what the agent pulls (and that is redacted at this boundary).
 """
+import os
 import sys
 import json
 
 from . import engine
+
+_TOOL_NAMES = ("capsule", "search", "context", "trace", "verify")
+
+
+def _build_path(path):
+    """Resolve + (optionally) confine the build path. Set PROBE_LOG_DIR to restrict
+    which files an agent may ask the server to read (defense-in-depth for the MCP
+    trust boundary); regular-file/size checks happen in cli._build_file."""
+    rp = os.path.realpath(path)
+    allowed = os.environ.get("PROBE_LOG_DIR")
+    if allowed:
+        ar = os.path.realpath(allowed)
+        if rp != ar and not rp.startswith(ar + os.sep):
+            raise ValueError("path outside PROBE_LOG_DIR: %s" % rp)
+    return rp
 
 TOOLS = [
     {"name": "build",
@@ -40,24 +56,36 @@ TOOLS = [
 ]
 
 
+_LOADERS = {}  # capture_id -> Loader; meta is loaded once per session, not per call
+
+
+def _loader(cid):
+    ld = _LOADERS.get(cid)
+    if ld is None:
+        if len(_LOADERS) >= 16:
+            _LOADERS.pop(next(iter(_LOADERS)))   # evict oldest (capture_id is a content hash)
+        ld = _LOADERS[cid] = engine.Loader(cid)
+    return ld
+
+
 def _call(name, a):
     if name == "build":
-        raw = open(a["path"], "rb").read()
-        cap, _ = engine.build(raw, budget_tokens=int(a.get("budget_tokens", 2000)))
+        from . import cli  # reuse the Rust-accelerated build path (Python fallback)
+        cap, _h, _eng = cli._build_file(_build_path(a["path"]), int(a.get("budget_tokens", 2000)))
         return cap
-    ld = engine.Loader(a["capture_id"])
+    if name not in _TOOL_NAMES:
+        raise ValueError("unknown tool: %s" % name)
+    ld = _loader(a["capture_id"])
     if name == "capsule":
         return ld.capsule_view()
     if name == "search":
         return ld.search(query=a.get("query"), level=a.get("level"), template_id=a.get("template_id"),
-                         limit=int(a.get("limit", 50)), cursor=int(a.get("cursor", 0)))
+                         limit=min(int(a.get("limit", 50)), 1000), cursor=int(a.get("cursor", 0)))
     if name == "context":
-        return ld.context(int(a["line"]), int(a.get("before", 5)), int(a.get("after", 5)))
+        return ld.context(int(a["line"]), min(int(a.get("before", 5)), 1000), min(int(a.get("after", 5)), 1000))
     if name == "trace":
         return ld.trace(a["trace_id"])
-    if name == "verify":
-        return ld.verify(a["fact_id"])
-    raise ValueError("unknown tool: %s" % name)
+    return ld.verify(a["fact_id"])
 
 
 def _send(obj):
