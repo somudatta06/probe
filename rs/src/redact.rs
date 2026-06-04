@@ -1,52 +1,42 @@
-//! Deterministic redaction at the local->cloud trust boundary.
+//! Deterministic redaction at the local->cloud trust boundary (port of probe/redact.py).
 //!
-//! Port of `probe/redact.py`. Raw logs stay unredacted on disk; anything that
-//! crosses into the capsule is redacted. Patterns are applied in order, then a
-//! backstop replaces long, dotless, high-entropy tokens.
+//! Catches real-format secrets (keyword may be glued after a prefix: db_password,
+//! x-api-key, client_secret), structured keys, cards (Luhn), SSN, auth headers; a
+//! high-entropy backstop catches bare blobs but PRESERVES UUIDs / hex SHAs / numeric
+//! ids so `trace` keeps working. The regex crate is linear-time -> no ReDoS.
 
-use regex::Regex;
+use regex::{Captures, Regex};
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
-struct Patterns {
-    list: Vec<(&'static str, Regex)>,
-    long_token: Regex,
+struct Pats {
+    whole: Vec<(&'static str, Regex)>,
+    cc: Regex,
+    auth: Regex,
+    bearer: Regex,
+    kv: Regex,
+    email: Regex,
+    long: Regex,
 }
 
-fn patterns() -> &'static Patterns {
-    static P: OnceLock<Patterns> = OnceLock::new();
-    P.get_or_init(|| Patterns {
-        list: vec![
-            (
-                "private_key",
-                // [\s\S]*? -> `(?s).*?` in the regex crate (dot matches newline).
-                Regex::new(r"-----BEGIN [A-Z ]*PRIVATE KEY-----(?s).*?-----END [A-Z ]*PRIVATE KEY-----")
-                    .unwrap(),
-            ),
-            (
-                "jwt",
-                Regex::new(r"eyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}").unwrap(),
-            ),
-            (
-                "aws_key",
-                Regex::new(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b").unwrap(),
-            ),
-            (
-                "bearer",
-                Regex::new(r"(?i)\bBearer\s+[A-Za-z0-9._\-]{8,}").unwrap(),
-            ),
-            (
-                "kv_secret",
-                Regex::new(r"(?i)\b(?:pass(?:word)?|pwd|secret|token|api[_-]?key|authorization)\s*[=:]\s*\S+")
-                    .unwrap(),
-            ),
-            (
-                "email",
-                Regex::new(r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b").unwrap(),
-            ),
+fn pats() -> &'static Pats {
+    static P: OnceLock<Pats> = OnceLock::new();
+    P.get_or_init(|| Pats {
+        whole: vec![
+            ("private_key", Regex::new(r"-----(?:BEGIN|END)[A-Z ]*PRIVATE KEY-----").unwrap()),
+            ("jwt", Regex::new(r"\beyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}").unwrap()),
+            ("aws_key", Regex::new(r"\b(?:AKIA|ASIA|AGPA|AIDA|AROA)[0-9A-Z]{12,20}\b").unwrap()),
+            ("gcp_key", Regex::new(r"\bAIza[0-9A-Za-z_\-]{20,}\b").unwrap()),
+            ("github_token", Regex::new(r"\bgh[pousr]_[0-9A-Za-z]{20,}\b").unwrap()),
+            ("slack_token", Regex::new(r"\bxox[baprs]-[0-9A-Za-z-]{8,}").unwrap()),
+            ("ssn", Regex::new(r"\b\d{3}-\d{2}-\d{4}\b").unwrap()),
         ],
-        // Backstop: long, dotless, high-entropy tokens. Excludes ".".
-        long_token: Regex::new(r"[A-Za-z0-9_\-+/=]{32,}").unwrap(),
+        cc: Regex::new(r"\b(?:\d[ -]?){13,19}\b").unwrap(),
+        auth: Regex::new(r#"(?i)([\w\-]*auth[\w\-]*\s*[:=]\s*(?:basic |bearer |digest |token )?"?)([^"\s&;,]{3,})"#).unwrap(),
+        bearer: Regex::new(r"(?i)(\bbearer\s+)([A-Za-z0-9._\-]{6,})").unwrap(),
+        kv: Regex::new(r#"(?i)([\w.\-]*?(?:passw(?:or)?d|pwd|secret|token|api[_\-]?key|access[_\-]?key|secret[_\-]?key|credential|passphrase)\s*[=:]\s*"?)([^"\s&;,]+)"#).unwrap(),
+        email: Regex::new(r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b").unwrap(),
+        long: Regex::new(r"[A-Za-z0-9]{20,}").unwrap(),
     })
 }
 
@@ -61,49 +51,65 @@ fn entropy(s: &str) -> f64 {
         n += 1;
     }
     let nf = n as f64;
-    -counts
-        .values()
-        .map(|&v| {
-            let p = v as f64 / nf;
-            p * p.log2()
-        })
-        .sum::<f64>()
+    -counts.values().map(|&v| { let p = v as f64 / nf; p * p.log2() }).sum::<f64>()
 }
 
-/// Return text with secrets replaced by `<redacted:type>` markers.
+fn luhn(d: &str) -> bool {
+    let n = d.len();
+    if !(13..=19).contains(&n) {
+        return false;
+    }
+    let (mut total, mut alt) = (0u32, false);
+    for ch in d.chars().rev() {
+        let mut x = ch as u32 - 48;
+        if alt {
+            x *= 2;
+            if x > 9 {
+                x -= 9;
+            }
+        }
+        total += x;
+        alt = !alt;
+    }
+    total % 10 == 0
+}
+
 pub fn redact(text: &str) -> String {
     if text.is_empty() {
         return text.to_string();
     }
-    let p = patterns();
+    let p = pats();
     let mut out = text.to_string();
-    for (name, pat) in &p.list {
-        out = pat
-            .replace_all(&out, format!("<redacted:{}>", name).as_str())
-            .into_owned();
+    for (name, pat) in &p.whole {
+        out = pat.replace_all(&out, format!("<redacted:{}>", name).as_str()).into_owned();
     }
-    // Entropy backstop: only replace a long dotless token if it is not already
-    // part of a redaction marker and its Shannon entropy >= 4.0.
-    p.long_token
-        .replace_all(&out, |caps: &regex::Captures| {
-            let tok = &caps[0];
-            if tok.contains("<redacted") {
-                tok.to_string()
-            } else if entropy(tok) >= 4.0 {
-                "<redacted:highentropy>".to_string()
-            } else {
-                tok.to_string()
-            }
-        })
-        .into_owned()
+    out = p.cc.replace_all(&out, |c: &Captures| {
+        let digits: String = c[0].chars().filter(|ch| ch.is_ascii_digit()).collect();
+        if luhn(&digits) { "<redacted:card>".to_string() } else { c[0].to_string() }
+    }).into_owned();
+    out = p.auth.replace_all(&out, |c: &Captures| format!("{}<redacted:auth>", &c[1])).into_owned();
+    out = p.bearer.replace_all(&out, |c: &Captures| format!("{}<redacted:bearer>", &c[1])).into_owned();
+    out = p.kv.replace_all(&out, |c: &Captures| format!("{}<redacted:kv_secret>", &c[1])).into_owned();
+    out = p.email.replace_all(&out, "<redacted:email>").into_owned();
+    out = p.long.replace_all(&out, |c: &Captures| {
+        let tok = &c[0];
+        if tok.contains("<redacted")
+            || tok.chars().all(|ch| ch.is_ascii_digit())
+            || tok.chars().all(|ch| ch.is_ascii_hexdigit())
+        {
+            tok.to_string()
+        } else if entropy(tok) >= 3.6 {
+            "<redacted:highentropy>".to_string()
+        } else {
+            tok.to_string()
+        }
+    }).into_owned();
+    out
 }
 
 #[allow(dead_code)]
 pub fn has_secret(text: &str) -> bool {
-    if text.is_empty() {
-        return false;
-    }
-    patterns().list.iter().any(|(_, pat)| pat.is_match(text))
+    !text.is_empty() && redact(text).contains("<redacted")
 }
 
 #[cfg(test)]
@@ -111,24 +117,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn redacts_jwt() {
-        let raw = "auth token=Bearer eyJhbGciOiJIUzI1Ni) but the jwt eyJabcdef.ghijkl.mnopqr ok";
-        let r = redact(raw);
-        assert!(!r.contains("eyJabcdef.ghijkl.mnopqr"));
+    fn redacts_real_format_secrets() {
+        for s in [
+            "db_password=hunter2", "client_secret=abc123def", "access_token=zzz9tok",
+            "card=4111111111111111", "ssn=123-45-6789", "X-Internal-Auth: t0knQx7",
+            "Authorization: Basic dXNlcjpwYXNz", "x-api-key=AKIAIOSFODNN7EXAMPLE",
+        ] {
+            assert!(redact(s).contains("<redacted"), "leaked: {}", s);
+        }
     }
 
     #[test]
-    fn keeps_dotted_identifiers() {
-        // psycopg2.OperationalError must survive (has a dot, backstop excludes dots).
-        let raw = "psycopg2.OperationalError: connection pool exhausted";
-        assert_eq!(redact(raw), raw);
-    }
-
-    #[test]
-    fn redacts_bearer() {
-        let raw = "Authorization: Bearer abcdefghijklmnop";
-        let r = redact(raw);
-        assert!(r.contains("<redacted:"));
-        assert!(!r.contains("abcdefghijklmnop"));
+    fn preserves_trace_identifiers() {
+        for s in [
+            "psycopg2.OperationalError: pool exhausted",
+            "request_id=550e8400-e29b-41d4-a716-446655440000",
+            "commit=9f2c3a1b4d5e6f70819a2b3c4d5e6f7081920304",
+            "order_id=1234567890123456",
+        ] {
+            assert!(!redact(s).contains("<redacted"), "over-redacted: {}", s);
+        }
     }
 }

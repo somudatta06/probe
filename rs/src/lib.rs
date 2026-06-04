@@ -514,7 +514,7 @@ fn select(
     records: &[Record],
     budget: usize,
     anchor: usize,
-) -> (Vec<Value>, usize) {
+) -> (Vec<Value>, usize, usize) {
     let mut chosen: Vec<Value> = Vec::new();
     let mut used: BTreeSet<usize> = BTreeSet::new();
     let mut tok: usize = 0;
@@ -536,8 +536,10 @@ fn select(
     for c in anom.into_iter().take(20) {
         take(c, &mut chosen, &mut used, &mut tok);
     }
-    // every sev >= 0.8 (original cluster order).
-    for c in clusters.iter().filter(|c| c.sev >= 0.8) {
+    // top 40 sev >= 0.8 by -score (was: ALL -> capsule runaway with many distinct errors).
+    let mut errs: Vec<&Cluster> = clusters.iter().filter(|c| c.sev >= 0.8).collect();
+    errs.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+    for c in errs.into_iter().take(40) {
         take(c, &mut chosen, &mut used, &mut tok);
     }
     // top 3 by count (stable).
@@ -556,6 +558,20 @@ fn select(
         take(c, &mut chosen, &mut used, &mut tok);
     }
 
+    // hard ceiling: trim lowest-score facts until <= budget*1.5; nothing silently lost.
+    let ceiling = budget * 3 / 2;
+    let mut truncated = 0usize;
+    if tok > ceiling {
+        chosen.sort_by(|a, b| match fact_score(a).partial_cmp(&fact_score(b)).unwrap() {
+            std::cmp::Ordering::Equal => fact_template_id(a).cmp(&fact_template_id(b)),
+            o => o,
+        });
+        while tok > ceiling && chosen.len() > 1 {
+            let f = chosen.remove(0);
+            tok -= (python_json_len(&f) / 4).max(1);
+            truncated += 1;
+        }
+    }
     // final sort: (-score, template_id), stable.
     chosen.sort_by(|a, b| {
         match fact_score(b).partial_cmp(&fact_score(a)).unwrap() {
@@ -563,7 +579,7 @@ fn select(
             o => o,
         }
     });
-    (chosen, tok)
+    (chosen, tok, truncated)
 }
 
 // ----------------------------------------------------------------- build
@@ -616,7 +632,7 @@ fn build_inner(
     };
 
     score_clusters(&mut clusters, anchor, n_rec, weights);
-    let (facts, tok) = select(&clusters, &records, budget_tokens, anchor);
+    let (facts, tok, truncated) = select(&clusters, &records, budget_tokens, anchor);
 
     // changes
     let mut changes: Vec<Value> = Vec::new();
@@ -707,6 +723,7 @@ fn build_inner(
     stats.insert("input_lines".into(), json!(n_lines));
     stats.insert("records".into(), json!(n_rec));
     stats.insert("capsule_tokens".into(), json!(tok));
+    stats.insert("truncated_templates".into(), json!(truncated));
     stats.insert("compression_x".into(), json!(compression_x));
 
     let mut capsule = Map::new();
