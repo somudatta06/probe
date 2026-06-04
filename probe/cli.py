@@ -15,10 +15,52 @@ import os
 import sys
 import json
 import time
+import stat as _stat
+import shutil
 import tempfile
 import subprocess
 
 from . import engine, gen, changes
+
+
+def _safe_to_read(path):
+    """Reject non-regular files (devices/FIFOs hang on read) and oversized files."""
+    st = os.stat(path)  # FileNotFoundError if missing
+    if not _stat.S_ISREG(st.st_mode):
+        raise ValueError("refusing to read non-regular file (device/fifo/dir): %s" % path)
+    if st.st_size > 2 * 1024 ** 3:
+        raise ValueError("file too large (%d bytes, cap 2 GiB): %s" % (st.st_size, path))
+
+
+def _rust_bin():
+    """The probe-rs accelerator, if available (PROBE_RS_BIN or on PATH)."""
+    p = os.environ.get("PROBE_RS_BIN") or shutil.which("probe-rs")
+    return p if p and os.path.exists(p) else None
+
+
+def _build_file(path, budget, change_events=None, engine_choice="auto"):
+    """Build a capture from a file, using the Rust engine when available (and no
+    change-event injection is needed), else the Python engine. Returns (capsule, id, engine)."""
+    _safe_to_read(path)
+    rb = _rust_bin()
+    want_rust = engine_choice == "rust" or (engine_choice == "auto" and rb and not change_events)
+    if engine_choice == "rust" and not rb:
+        print("probe: --engine rust requested but probe-rs not found; using python", file=sys.stderr)
+        want_rust = False
+    if want_rust and rb:
+        r = subprocess.run([rb, "build", path, "--cache", engine._cache_dir(), "--budget", str(budget)],
+                           capture_output=True, text=True)
+        if r.returncode == 0 and r.stdout.strip():
+            try:
+                cap = json.loads(r.stdout)
+                return cap, cap["index"]["capture_id"], "rust"
+            except (json.JSONDecodeError, KeyError, TypeError) as e:
+                print("probe: rust output invalid (%s), using python" % e, file=sys.stderr)
+        else:
+            print("probe: rust engine failed, using python:\n%s" % (r.stderr or "")[:200], file=sys.stderr)
+    raw = open(path, "rb").read()
+    cap, h = engine.build(raw, budget_tokens=budget, change_events=change_events)
+    return cap, h, "python"
 
 
 def _flags(args):
@@ -26,9 +68,16 @@ def _flags(args):
     i = 0
     while i < len(args):
         a = args[i]
+        if a == "--":                                  # everything after -- is positional
+            pos.extend(args[i + 1:])
+            break
         if a.startswith("--"):
-            out[a[2:]] = args[i + 1] if i + 1 < len(args) else True
-            i += 2
+            if i + 1 < len(args) and not args[i + 1].startswith("--"):
+                out[a[2:]] = args[i + 1]
+                i += 2
+            else:
+                out[a[2:]] = True                      # bare flag, don't steal the next token
+                i += 1
         else:
             pos.append(a)
             i += 1
@@ -40,11 +89,11 @@ def _p(obj):
 
 
 def cmd_build(pos, fl):
-    raw = open(pos[0], "rb").read()
     ce = changes.git_changes(fl["repo"]) if fl.get("repo") else None
-    cap, h = engine.build(raw, budget_tokens=int(fl.get("budget", 2000)), change_events=ce)
+    cap, h, eng = _build_file(pos[0], int(fl.get("budget", 2000)), ce, fl.get("engine", "auto"))
     _p(cap)
-    print("\ncapture_id: %s   (drill down: probe search %s --query ...)" % (h, h), file=sys.stderr)
+    print("\ncapture_id: %s   engine: %s   (drill down: probe search %s --query ...)"
+          % (h, eng, h), file=sys.stderr)
 
 
 def cmd_multi(pos, fl):
@@ -88,15 +137,23 @@ def cmd_multitest(pos, fl):
 
 
 def cmd_wrap(pos, fl):
-    if "--" in pos:
-        pos = pos[pos.index("--") + 1:]
-    elif "--" in sys.argv:
-        pos = sys.argv[sys.argv.index("--") + 1:]
-    proc = subprocess.run(pos, capture_output=True, text=True)
-    raw = (proc.stdout + proc.stderr).encode("utf-8", "replace")
-    cap, h = engine.build(raw, budget_tokens=int(fl.get("budget", 2000)))
+    cmdv = pos  # _flags() puts everything after `--` into pos
+    if not cmdv:
+        print("usage: probe wrap -- <command...>", file=sys.stderr)
+        sys.exit(2)
+    proc = subprocess.run(cmdv, capture_output=True, text=True)
+    tmp = os.path.join(tempfile.gettempdir(), "probe_wrap_%d.log" % os.getpid())
+    try:
+        with open(tmp, "w") as f:
+            f.write(proc.stdout + proc.stderr)
+        cap, h, eng = _build_file(tmp, int(fl.get("budget", 2000)), None, fl.get("engine", "auto"))
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
     _p(cap)
-    print("\ncapture_id: %s" % h, file=sys.stderr)
+    print("\ncapture_id: %s   engine: %s" % (h, eng), file=sys.stderr)
 
 
 def cmd_capsule(pos, fl):

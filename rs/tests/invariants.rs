@@ -89,6 +89,20 @@ fn baseline_shift() {
 }
 
 #[test]
+fn corrupt_store_no_panic() {
+    let raw = generate_incident(N);
+    let cache = std::env::temp_dir().join("probe_rs_corrupt");
+    let cs = cache.to_string_lossy().to_string();
+    let _ = std::fs::remove_dir_all(&cache);
+    let (_c, id) = build_capture(raw.as_bytes(), 2000, &cs);
+    // truncate/corrupt the store; decoding must degrade gracefully, never panic.
+    std::fs::write(format!("{}/captures/{}/store.clp", cs, id), vec![0u8, 1, 2, 3, 4, 5]).unwrap();
+    let mut ld = Loader::open(&id, &cs);
+    let _ = ld.all_lines();
+    let _ = ld.verify("F0");
+}
+
+#[test]
 fn clp_lossless() {
     let raw = generate_incident(N);
     let cache = std::env::temp_dir().join("probe_rs_test_clp");

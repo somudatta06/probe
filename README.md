@@ -172,11 +172,12 @@ loses the cause; frequency surfaces the loud symptom; the scored capsule keeps t
 root cause every time. Calibration (`bench.calibrate`) puts the true root cause as the
 **#1 fact (MRR 1.000)**.
 
-**Rust port** (`rs/`): all **7 invariants** pass incl. lossless round-trip (`cargo test`);
-`probe-rs bench --lines 1200000` → **1.2M lines in ~1.9 s = 611k lines/sec** (pure-Python was
-8.8 s; codag-drain's published grouping is 88k lines/sec). The Rust binary now **persists the
-CLP store and reads it back** (`build_capture` + `Loader`) — the fast path and the storage
-format are one artifact.
+**Rust accelerator** (`rs/`, wired into the CLI): all **7 invariants** pass; it writes the *same
+typed store* the Python `Loader` reads — **cross-language lossless, verified** (a Rust-built
+capture decodes byte-for-byte in Python, and `search`/`verify`/MCP work on it). `probe build/wrap`
+**auto-use it** when `probe-rs` is on PATH (or `PROBE_RS_BIN` is set), falling back to Python
+otherwise (`--engine py|rust|auto`). **1.2M lines: 8.9 s (Python) → 2.4 s (Rust) end-to-end via
+the CLI (~3.8×)**; `install.sh` builds it automatically when cargo is present.
 
 **Cross-service + change providers** (`bin/probe multitest`): `build_multi` merges
 services' streams by timestamp; `trace <id>` stitches a request across services (root
@@ -208,11 +209,11 @@ source ~/.cargo/env && CARGO_TARGET_DIR=/tmp/probe-rs-target \
 
 ## Remaining roadmap
 
-- Capture is a **typed, lossless, seekable CLP-style store** (Python): integer variables as
-  zig-zag delta varints — **34.4× @100k, 114.8× @1.2M**, beating both gzip and the text store.
-  Remaining toward CLP's ~169×: port the typed format into the Rust crate (Rust is on the v1
-  text-columnar store), add delta-timestamp encoding, and validate on real high-cardinality
-  production logs (synthetic inflates the ratio; real LogHub here is 13.2×).
+- Capture is a **typed, lossless, seekable CLP-style store in both Python and Rust**
+  (byte-compatible — either engine's capture is readable by the other): integer variables as
+  zig-zag delta varints — **34.4× @100k, 114.8× @1.2M**, beating gzip + the text store.
+  Remaining toward CLP's ~169×: delta-timestamp encoding + binary float typing, validated on
+  real high-cardinality production logs (synthetic inflates the ratio; real LogHub here is 13.2×).
 - `bench.diagnosis --llm` is wired for a **real blind diagnose + judge** (auto-detects
   Anthropic / OpenAI / a logged-in `claude` CLI; deterministic fallback). A frontier-model
   spot-check (N=2) scored **capsule 1.00 vs truncated-raw 0.00 vs frequency-only 0.00** at

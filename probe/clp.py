@@ -139,8 +139,14 @@ def _encode_block(chunk, nslots):
                 str_items.extend(vals)
 
     ids_blob = b"".join(_uvarint(x) for x in ids)
-    payload = _frame([ts_text.encode("utf-8"), ids_blob, bytes(flags),
-                      "\n".join(str_items).encode("utf-8"), bytes(int_blob)])
+    # length-prefix string values (a value may contain '\n' — e.g. a binary/\\x00
+    # line stored whole; '\n'-join would corrupt the block on decode).
+    str_blob = bytearray()
+    for v in str_items:
+        vb = v.encode("utf-8")
+        str_blob += _uvarint(len(vb))
+        str_blob += vb
+    payload = _frame([ts_text.encode("utf-8"), ids_blob, bytes(flags), bytes(str_blob), bytes(int_blob)])
     return gzip.compress(payload, 9, mtime=0)
 
 
@@ -152,7 +158,11 @@ def _decode_block(blob, logtypes, nslots):
         x, i = _read_uvarint(ids_b, i)
         ids.append(x)
     counts = Counter(ids)
-    str_items = str_b.decode("utf-8").split("\n") if len(str_b) else []
+    str_items, _p = [], 0
+    while _p < len(str_b):
+        n, _p = _read_uvarint(str_b, _p)
+        str_items.append(str_b[_p:_p + n].decode("utf-8"))
+        _p += n
 
     slotvals, fi, bi, si = {}, 0, 0, 0
     for lid in sorted(set(ids)):
