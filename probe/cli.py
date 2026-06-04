@@ -20,7 +20,7 @@ import shutil
 import tempfile
 import subprocess
 
-from . import engine, gen, changes
+from . import engine, gen, changes, redact
 
 
 def _safe_to_read(path):
@@ -232,6 +232,31 @@ def cmd_selftest(pos, fl):
     chk("bounded", cap["stats"]["capsule_tokens"] <= budget * 1.5,
         "capsule_tokens=%d budget=%d" % (cap["stats"]["capsule_tokens"], budget))
 
+    # --- adversarial safety checks (the heuristic wrappers that failed real-log review) ---
+    _secrets = ["db_password=hunter2", "client_secret=abc123def", "access_token=zzz9tok",
+                "card=4111111111111111", "ssn=123-45-6789", "X-Internal-Auth: t0knQx7",
+                "Authorization: Basic dXNlcjpwYXNz"]
+    _ids = ["req=550e8400-e29b-41d4-a716-446655440000", "sha=9f2c3a1b4d5e6f70819a2b3c4d5e6f7081920304"]
+    red_ok = all("redacted" in redact.redact(s) for s in _secrets) and all("redacted" not in redact.redact(s) for s in _ids)
+    chk("redaction_adversarial", red_ok, "%d real-format secrets redacted; UUIDs/SHAs preserved" % len(_secrets))
+
+    many = "\n".join("2026-01-01T00:%02d:%02d ERROR svc_%d failed code=%d uniq%d"
+                     % (i // 60, i % 60, i, i, i) for i in range(400)) + "\n"
+    capb, _ = engine.build(many.encode(), budget_tokens=500)
+    chk("bounded_worstcase", capb["stats"]["capsule_tokens"] <= 500 * 1.5,
+        "%d distinct errors @budget 500 -> %d tok, truncated=%d"
+        % (capb["stats"]["templates"], capb["stats"]["capsule_tokens"], capb["stats"]["truncated_templates"]))
+
+    ctx = ld.context(100, before=999999, after=999999)
+    srch = ld.search(limit=-5)
+    chk("drilldown_capped", len(ctx["lines"]) <= 405 and len(srch["results"]) <= 1,
+        "huge context-window -> %d lines; search limit=-5 -> %d results" % (len(ctx["lines"]), len(srch["results"])))
+
+    t = time.time()
+    redact.redact(("-----BEGIN PRIVATE KEY-----\n" * 3000) + ("x" * 60 + "\n") * 100)
+    redos_ms = (time.time() - t) * 1000
+    chk("redos_safe", redos_ms < 1000, "PEM-flood redaction in %.0f ms (<1000)" % redos_ms)
+
     print("=" * 64)
     print("  probe selftest  (%s lines, budget %d tokens)" % (f"{n:,}", budget))
     print("=" * 64)
@@ -287,7 +312,11 @@ def main(argv=None):
         print("unknown command: %s\n%s" % (cmd, __doc__))
         sys.exit(2)
     pos, fl = _flags(argv[1:])
-    _CMDS[cmd](pos, fl)
+    try:
+        _CMDS[cmd](pos, fl)
+    except (FileNotFoundError, ValueError, OSError, KeyError, IndexError) as e:
+        print("error: %s: %s" % (type(e).__name__, e), file=sys.stderr)
+        sys.exit(2)
 
 
 if __name__ == "__main__":

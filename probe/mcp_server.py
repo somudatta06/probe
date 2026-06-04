@@ -101,6 +101,7 @@ def serve():
         try:
             req = json.loads(line)
         except ValueError:
+            _send({"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "Parse error"}})
             continue
         mid, method = req.get("id"), req.get("method")
         if method == "initialize":

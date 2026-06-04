@@ -217,6 +217,10 @@ def _fact(c, records, anchor):
     }
 
 
+def _tok(f):
+    return max(1, len(json.dumps(f)) // 4)
+
+
 def _select(clusters, records, budget, anchor):
     chosen, used, tok = [], set(), 0
 
@@ -227,25 +231,34 @@ def _select(clusters, records, budget, anchor):
         f = _fact(c, records, anchor)
         used.add(c["id"])
         chosen.append(f)
-        tok += max(1, len(json.dumps(f)) // 4)
+        tok += _tok(f)
 
-    # reserved quotas (the high-signal tail is never truncated away)
+    # reserved quotas — CAPPED, so the budget holds even with many distinct errors
+    # (the incident case). Dropped templates stay in raw + index + stats.templates.
     for c in sorted([c for c in clusters if c["anomaly"] >= 0.999], key=lambda c: -c["score"])[:20]:
-        take(c)                                   # all new / went-silent templates
-    for c in [c for c in clusters if c["sev"] >= 0.8]:
-        take(c)                                   # every error/fatal template
+        take(c)                                   # top new / went-silent templates
+    for c in sorted([c for c in clusters if c["sev"] >= 0.8], key=lambda c: -c["score"])[:40]:
+        take(c)                                   # top error/fatal templates (was: ALL -> runaway)
     for c in sorted(clusters, key=lambda c: -c["count"])[:3]:
         take(c)                                   # a routine baseline sample
     for c in sorted(clusters, key=lambda c: -c["score"]):
         if tok >= budget:
             break
         take(c)                                   # fill remaining budget greedily
+
+    # hard ceiling: trim lowest-score facts until <= budget*1.5; never silently lose them
+    ceiling, truncated = int(budget * 1.5), 0
+    if tok > ceiling:
+        chosen.sort(key=lambda f: (f["score"], f["template_id"]))   # lowest first
+        while tok > ceiling and len(chosen) > 1:
+            tok -= _tok(chosen.pop(0))
+            truncated += 1
     chosen.sort(key=lambda f: (-f["score"], f["template_id"]))
-    return chosen, tok
+    return chosen, tok, truncated
 
 
 # ----------------------------------------------------------------------------- finalize (shared)
-def _finalize(records, clusters, facts, tok, anchor, n_lines, n_rec,
+def _finalize(records, clusters, facts, tok, truncated, anchor, n_lines, n_rec,
               raw_bytes, h, cache_dir, services, budget_tokens, change_events):
     changes = []
     for r in records:
@@ -294,7 +307,9 @@ def _finalize(records, clusters, facts, tok, anchor, n_lines, n_rec,
         "hypotheses": hyps,
         "index": {"capture_id": h, "tools": ["capsule", "search", "context", "trace", "verify"]},
         "stats": {"templates": len(clusters), "input_lines": n_lines, "records": n_rec,
-                  "capsule_tokens": tok, "compression_x": round(n_lines / max(1, tok), 1)},
+                  "capsule_tokens": tok, "truncated_templates": truncated,
+                  "compression_x": round(n_lines / max(1, tok), 1),
+                  "low_repetition": n_rec > 100 and len(clusters) > 0.5 * n_rec},
     }
 
     traces_index = defaultdict(list)
@@ -327,9 +342,9 @@ def build(raw_bytes, budget_tokens=2000, weights=None, cache_dir=None, change_ev
     err_idx = [i for i, r in enumerate(records) if r["sev"] >= 0.8]
     anchor = err_idx[0] if err_idx else int(0.85 * n_rec)
     _score(clusters, anchor, n_rec, weights)
-    facts, tok = _select(clusters, records, budget_tokens, anchor)
+    facts, tok, truncated = _select(clusters, records, budget_tokens, anchor)
 
-    return _finalize(records, clusters, facts, tok, anchor, n_lines, n_rec,
+    return _finalize(records, clusters, facts, tok, truncated, anchor, n_lines, n_rec,
                      raw_bytes, h, cache_dir, [], budget_tokens, change_events)
 
 
@@ -362,12 +377,12 @@ def build_multi(sources, budget_tokens=2000, weights=None, cache_dir=None, chang
     err_idx = [i for i, r in enumerate(recs) if r["sev"] >= 0.8]
     anchor = err_idx[0] if err_idx else int(0.85 * n_rec)
     _score(clusters, anchor, n_rec, weights)
-    facts, tok = _select(clusters, recs, budget_tokens, anchor)
+    facts, tok, truncated = _select(clusters, recs, budget_tokens, anchor)
 
     raw_bytes = ("\n".join(merged) + "\n").encode("utf-8")
     h = hashlib.sha256(raw_bytes).hexdigest()[:16]
     services = sorted({svc for svc, _ in sources})
-    return _finalize(recs, clusters, facts, tok, anchor, n_lines, n_rec,
+    return _finalize(recs, clusters, facts, tok, truncated, anchor, n_lines, n_rec,
                      raw_bytes, h, cache_dir, services, budget_tokens, change_events)
 
 
@@ -463,6 +478,8 @@ class Loader:
         return out
 
     def search(self, query=None, level=None, template_id=None, limit=50, cursor=0):
+        limit = max(1, min(int(limit), 500))      # clamp here -> covers CLI and MCP
+        cursor = max(0, int(cursor))
         hits = []
         for ridx, row in enumerate(self.meta["records"]):
             s, e, cid, lvl, svc = self._rec(row)
@@ -478,6 +495,7 @@ class Loader:
         return {"total": len(hits), "cursor": cursor, "next_cursor": nxt, "results": page}
 
     def context(self, line, before=5, after=5):
+        before, after = max(0, min(int(before), 200)), max(0, min(int(after), 200))
         a, b = max(1, line - before), line + after
         ls = self._lines(a, b)
         return {"from": a, "to": (ls[-1][0] if ls else a),

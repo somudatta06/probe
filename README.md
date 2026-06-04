@@ -207,6 +207,25 @@ source ~/.cargo/env && CARGO_TARGET_DIR=/tmp/probe-rs-target \
 /tmp/probe-rs-target/release/probe-rs bench --lines 1200000
 ```
 
+## Security & honest limits
+
+- **Redaction is a security boundary** (the capsule goes to a cloud LLM). It catches
+  real-format secrets — `db_password`/`client_secret`/`access_token` (keyword glued
+  after a prefix), API/cloud keys, JWT, PEM, **credit cards (Luhn)**, SSNs, and auth
+  headers incl. the credential after a scheme — while **preserving UUIDs / hex SHAs /
+  numeric IDs** so `trace` keeps working. It's heuristic and errs toward over-redaction
+  (e.g. it'll mask `author=`); tune as needed. Set **`PROBE_LOG_DIR`** to restrict which
+  files the MCP `build` tool may read. These cases are now in `selftest`
+  (`redaction_adversarial`, `bounded_worstcase`, `drilldown_capped`, `redos_safe`) so
+  they can't regress — in both Python and Rust.
+- **Realistic compression: ~40–56× on structured service logs, down to ~5× on
+  high-cardinality stdout/terminal dumps** (near one template per line — nothing to
+  collapse; `stats.low_repetition` flags this). The **690× headline is synthetic
+  best-case**; expect 40–56× on real logs.
+- **`bounded` holds on the worst case** (many distinct error templates): reserves are
+  capped and a hard `budget×1.5` ceiling trims lowest-score facts, surfacing
+  `stats.truncated_templates` (dropped templates stay in raw + index, fully retrievable).
+
 ## Remaining roadmap
 
 - Capture is a **typed, lossless, seekable CLP-style store in both Python and Rust**
