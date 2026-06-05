@@ -913,13 +913,33 @@ pub fn generate_incident(n_lines: usize) -> String {
 /// capsule.json) under `<cache_dir>/captures/<id>/`. Returns (capsule, id).
 pub fn build_capture(raw_bytes: &[u8], budget_tokens: usize, cache_dir: &str) -> (Value, String) {
     let (capsule, h, records, clusters) = build_inner(raw_bytes, budget_tokens, &Weights::default());
-    write_capture(cache_dir, &h, &records, &clusters, &capsule);
+    let raw_sha256 = sha256_hex(raw_bytes);
+    write_capture(cache_dir, &h, &raw_sha256, &records, &clusters, &capsule);
     (capsule, h)
 }
 
-fn write_capture(cache_dir: &str, h: &str, records: &[Record], clusters: &[Cluster], capsule: &Value) {
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut h = Sha256::new();
+    h.update(bytes);
+    h.finalize().iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+/// Lock a cache path to the owner (dirs 0700 / files 0600). store.clp holds the
+/// pre-redaction raw logs, so co-tenants on shared infra must not be able to read it.
+#[cfg(unix)]
+fn chmod(p: &str, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode));
+}
+#[cfg(not(unix))]
+fn chmod(_p: &str, _mode: u32) {}
+
+fn write_capture(cache_dir: &str, h: &str, raw_sha256: &str, records: &[Record], clusters: &[Cluster], capsule: &Value) {
     let dir = format!("{}/captures/{}", cache_dir, h);
     std::fs::create_dir_all(&dir).unwrap();
+    for p in [cache_dir.to_string(), format!("{}/captures", cache_dir), dir.clone()] {
+        chmod(&p, 0o700);
+    }
 
     // CLP-style lossless columnar store: dedup logtype dict + per-record (ts, id, vars).
     let mut lt_id: HashMap<String, usize> = HashMap::new();
@@ -933,7 +953,10 @@ fn write_capture(cache_dir: &str, h: &str, records: &[Record], clusters: &[Clust
         });
         rows.push((ts, id, vars));
     }
-    let blocks = clp::write_store(&format!("{}/store.clp", dir), &rows, &logtypes, 16384);
+    let store_path = format!("{}/store.clp", dir);
+    let blocks = clp::write_store(&store_path, &rows, &logtypes, 16384);
+    chmod(&store_path, 0o600);
+    let store_sha256 = sha256_hex(&std::fs::read(&store_path).unwrap());
 
     let records_json: Vec<Value> = records
         .iter()
@@ -958,13 +981,15 @@ fn write_capture(cache_dir: &str, h: &str, records: &[Record], clusters: &[Clust
         "traces": traces,
         "logtypes": logtypes,
         "blocks": blocks_json,
+        "raw_sha256": raw_sha256,
+        "store_sha256": store_sha256,
     });
-    std::fs::write(format!("{}/meta.json", dir), serde_json::to_string(&meta).unwrap()).unwrap();
-    std::fs::write(
-        format!("{}/capsule.json", dir),
-        serde_json::to_string_pretty(capsule).unwrap(),
-    )
-    .unwrap();
+    let meta_path = format!("{}/meta.json", dir);
+    std::fs::write(&meta_path, serde_json::to_string(&meta).unwrap()).unwrap();
+    chmod(&meta_path, 0o600);
+    let cap_path = format!("{}/capsule.json", dir);
+    std::fs::write(&cap_path, serde_json::to_string_pretty(capsule).unwrap()).unwrap();
+    chmod(&cap_path, 0o600);
 }
 
 #[derive(Deserialize)]
@@ -980,6 +1005,10 @@ struct Meta {
     traces: BTreeMap<String, Vec<usize>>,
     logtypes: Vec<String>,
     blocks: Vec<(usize, u64, usize)>,
+    #[serde(default)]
+    raw_sha256: String,
+    #[serde(default)]
+    store_sha256: String,
 }
 
 /// Read-only drill-down over a CLP capture. Random access decodes only the
@@ -993,12 +1022,30 @@ pub struct Loader {
 
 impl Loader {
     pub fn open(capture_id: &str, cache_dir: &str) -> Loader {
+        // Path-traversal guard: capture_id is sha256(raw)[:16] — 16 lowercase hex chars.
+        assert!(
+            capture_id.len() == 16
+                && capture_id.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+            "invalid capture_id"
+        );
         let dir = format!("{}/captures/{}", cache_dir, capture_id);
         let meta: Meta =
             serde_json::from_str(&std::fs::read_to_string(format!("{}/meta.json", dir)).unwrap()).unwrap();
+        // Integrity: id must equal raw_sha256[:16] and store.clp must match store_sha256.
+        assert!(
+            !meta.raw_sha256.is_empty() && !meta.store_sha256.is_empty(),
+            "capture integrity: missing checksums"
+        );
+        assert_eq!(&meta.raw_sha256[..16], capture_id, "capture integrity: id mismatch");
+        let store_path = format!("{}/store.clp", dir);
+        assert_eq!(
+            sha256_hex(&std::fs::read(&store_path).unwrap()),
+            meta.store_sha256,
+            "capture integrity: store.clp hash mismatch"
+        );
         let capsule: Value =
             serde_json::from_str(&std::fs::read_to_string(format!("{}/capsule.json", dir)).unwrap()).unwrap();
-        let reader = clp::Reader::open(&format!("{}/store.clp", dir), meta.blocks.clone(), meta.logtypes.clone());
+        let reader = clp::Reader::open(&store_path, meta.blocks.clone(), meta.logtypes.clone());
         let starts = meta.records.iter().map(|r| r.0).collect();
         Loader { meta, capsule, reader, starts }
     }

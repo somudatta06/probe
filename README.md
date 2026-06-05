@@ -1,116 +1,101 @@
 # probe
 
-**Logs an agent can investigate, not just read.**
+![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)
+![Python](https://img.shields.io/badge/python-3.8%2B-blue.svg)
+![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen.svg)
 
-`probe` turns a log firehose into one immutable, redacted, indexed **incident
-snapshot** in a single deterministic pass. The agent gets a cheap ranked
-**capsule** (the first page), and can drill into the *full, retained* logs on
-demand — every claim re-derives from raw. No model, no GPU, no server, nothing
-leaves your box but what the agent pulls.
+**Logs your AI agent can investigate, not just read.**
 
-This is the local-first, deterministic answer to hosted log-compression services
-(e.g. Codag): same "huge logs → tiny artifact" win, but **lossless underneath,
-verifiable, private, and ~$0 to run** because the work happens on your machine
-and the reasoning is done by the agent you already pay for.
+probe turns large log files into a short, ranked summary your AI agent can read,
+then lets the agent search the full logs on demand. It runs on your own machine.
+It removes secrets before anything is sent to a model. There is no server to run
+and no per-use cost.
 
-> Reference implementation in Python (stdlib only). The hot path (templating +
-> scoring) ports to Rust/Go for the shipped single binary.
+## The problem
 
----
+When something breaks, the logs that explain it are often too large to send to a
+language model. A million log lines can cost more than twenty dollars to send to a
+large model in one request, and most of those lines are routine. If you cut the logs
+down to fit, you usually remove the few lines that actually matter.
 
-## What it does (measured)
+## What probe does
 
-`bin/probe selftest --lines 1200000` on a synthetic incident (a DB-pool-exhaustion
-cascade buried in routine noise, plus a planted secret and a heartbeat that goes
-silent):
+probe reads the logs once and produces two things:
 
-```
-input lines ........ 1,200,000
-capsule tokens ..... ~1,740
-compression ........ 690x  (lines / token)
-build time ......... 8.8 s   pure Python, 1 core, no GPU  (Rust port: sub-second)
-capsule cost ....... $0.005  vs ~$21.60 to feed raw to a frontier model
-```
+1. A short summary, which we call the capsule. It holds the log lines most likely to
+   explain the incident, ranked by how relevant they are, with routine messages
+   collapsed into counts. It is small enough to send to a model at low cost.
+2. A full, searchable copy of the logs on disk. Nothing is thrown away. The agent can
+   search it, read the lines around any event, follow a single request across services,
+   and re-check any claim against the original lines.
 
-The capsule the agent receives (real output, trimmed):
+The agent reads the summary first, then asks for more only where its question leads.
+Every number in the summary can be traced back to real log lines.
 
-```
-EVIDENCE (ranked by EvidenceScore):
-  F12  score=0.95  x1     new,error,near_incident,shares_trace,multiline | ERROR psycopg2.OperationalError: could not connect ...
-  F13  score=0.95  x2     new,error,near_incident,shares_trace           | ERROR retry <num>/<num> db_users id=abc124
-  F14  score=0.95  x1     new,error,near_incident,shares_trace           | ERROR pool exhausted, queue=<num> id=abc125
-  F11  score=0.80  x2     near_incident                                  | WARN  pool acquire <*>            (the trigger)
-  F9   score=0.49  x169   went_silent                                    | INFO  heartbeat ok seq=<num>      (baseline shift)
-CHANGES:    deploy released sha=9f2c3a1 service=db version=v2.3.1
-HYPOTHESIS: psycopg2.OperationalError emerged near line 1020004, correlated with a change
-            and 'heartbeat' going silent   [confidence: medium, rests_on: F12, F9]
-ROUTINE collapsed: 69k lines -> 3 template counts
-```
+probe does not guess a root cause for you. It surfaces ranked facts and clearly labeled
+guesses, and leaves the conclusion to the agent or to you.
 
-Note what it does **not** do: it never emits a `root_cause` verdict. It surfaces
-ranked, provenance-stamped **facts** + clearly-labeled **hypotheses**. The agent
-concludes, and can `verify` any fact against raw lines.
+## Who it is for
 
----
+Anyone whose AI agent needs to read logs:
 
-## Design in one breath
+- On-call engineers and site reliability engineers working through an incident.
+- Security and platform teams that cannot send raw logs to an outside service.
+- Teams in finance, healthcare, and government, where logs have to stay on their own
+  machines.
+- Anyone using an AI coding agent such as Claude Code or Cursor who wants it to read
+  real production logs without a large bill.
 
-**Build once, view many.** One streaming pass does: multiline-group → Drain
-templatize → count → in-window baseline → **EvidenceScore** → redact → index →
-persist. The capsule and every drill-down tool are just *views* over the same
-immutable artifact, so investigation costs near-zero extra build work.
+## How it works
 
-**EvidenceScore** ranks each template by `0.40·anomaly + 0.25·severity +
-0.20·proximity + 0.10·rarity + 0.05·causal` — anomaly (new / went-silent / rate
-shift vs an in-window baseline, so it works with **no history**) and severity
-dominate. Selection fills the token budget greedily **but reserves slots** for
-the first/last error, every new/silent template, multiline error spans (kept
-atomic), and a routine sample — so the high-signal tail is never truncated away.
+A single pass over the log file does all of the following:
 
-### Invariants (what "robust" means here — all enforced as tests)
+1. Groups lines that belong together, so a stack trace stays as one record.
+2. Finds the repeating shape of each line, so routine messages collapse into counts.
+3. Compares each kind of line against the rest of the same file, so probe can flag what
+   is new, what stopped happening, and what changed rate. This needs no prior history.
+4. Ranks lines by how likely they are to explain the incident.
+5. Removes secrets.
+6. Saves a full, searchable copy on disk.
 
-| Invariant | Guarantee |
-|---|---|
-| **conservation** | every input line is accounted for; none silently dropped |
-| **soundness** | every cited line/number exists in raw and re-derives (`verify`) |
-| **determinism** | same bytes → byte-identical capsule → cacheable |
-| **redaction boundary** | no secret crosses local→cloud (raw on disk stays intact) |
-| **never-lose-a-signal** | a parser miss routes to a scored rare pool, not the bin |
-| **bounded** | RAM O(templates + budget); every tool result size-capped |
-
-`bin/probe selftest` runs all six as property tests over a 100k-line incident.
-
----
+The summary and every search are views over that one saved copy, so investigating costs
+almost no extra work.
 
 ## Install
 
 ```bash
-./install.sh          # isolated venv, puts `probe` on your PATH (zero runtime deps)
-# alternatives:  pipx install .   ·   pip install .   ·   or run ./bin/probe with no install
+./install.sh
 ```
+
+This sets up an isolated environment and puts `probe` on your PATH. There are no runtime
+dependencies. You can also run `./bin/probe` directly without installing, or use
+`pip install .`.
 
 ## Quickstart
 
 ```bash
-probe selftest                       # run the invariant suite + demo
-probe gen   /tmp/incident.log --lines 200000
-probe build /tmp/incident.log        # -> capsule (stdout) + capture_id (stderr)
+probe selftest                         # run the checks and a short demo
+probe build /path/to/app.log           # prints the summary and a capture id
 
-# drill down over the retained, indexed capture:
+# then search the full logs:
 probe search  <capture_id> --level ERROR --limit 20
 probe context <capture_id> 85004 --before 5 --after 10
-probe trace   <capture_id> abc124    # all lines on a request id (cross-service when multi-stream)
-probe verify  <capture_id> F12       # re-derive the fact's count from raw + sample lines
+probe trace   <capture_id> <request_id>
+probe verify  <capture_id> F12         # re-derive a fact from the original lines
+```
 
-# wrap any log source your agent already runs (captures stdout + stderr):
+You can also wrap any command your agent already runs and capture its output:
+
+```bash
 probe wrap -- kubectl logs api -n prod --tail=200000
 probe wrap -- journalctl -u api --since "1 hour ago"
 probe wrap -- docker compose logs api
 ```
 
-## Wire it into an agent (MCP)
+## Use it with an AI agent (Model Context Protocol)
 
-Claude Code / Cursor / Codex — add to your MCP config (e.g. `.mcp.json`):
+probe speaks the Model Context Protocol (MCP), so agents that support MCP, such as
+Claude Code and Cursor, can call it directly. Add this to your MCP config:
 
 ```json
 {
@@ -120,123 +105,123 @@ Claude Code / Cursor / Codex — add to your MCP config (e.g. `.mcp.json`):
 }
 ```
 
-If your agent can't find `probe` on its PATH, use the absolute path `install.sh` prints
-(e.g. `~/.local/bin/probe`). Verified tools over JSON-RPC: `build`, `capsule`, `search`,
-`context`, `trace`, `verify`.
+The agent gets these tools: `build`, `capsule`, `search`, `context`, `trace`, `verify`.
+It reads the short summary first, then pulls more as its questions require. No model runs
+inside probe. Your agent does the reasoning.
 
-Tools exposed: `build`, `capsule`, `search`, `context`, `trace`, `verify`.
-The agent reads the cheap `capsule` first, then expands only as its hypothesis
-demands — query-time, agent-driven retrieval instead of one-shot guess-the-query
-compression.
+## What you get
 
----
+Running `probe selftest` on a generated incident of 1.2 million log lines (a database
+connection pool running out, buried in routine traffic, with a planted secret and a
+heartbeat that goes quiet):
 
-## Why this beats a hosted one-shot compressor
+| measure | value |
+|---|---|
+| input | 1,200,000 lines |
+| summary | about 1,740 tokens (the units a model is billed by) |
+| build time | 8.8 seconds in Python on one core, under one second with the optional Rust build |
+| cost to send the summary to a model | about half a cent, against roughly twenty dollars for the raw logs |
 
-| | hosted capsule (e.g. Codag) | probe |
-|---|---|---|
-| logs after compression | thrown away (lossy funnel) | **retained, indexed, queryable** |
-| can the agent verify a claim? | no | **yes — `verify` re-derives from raw** |
-| picks lines before the query | yes (query-blind) | capsule is page 1; **agent drives drill-down** |
-| root-cause label | asserted by a model | **facts + labeled hypotheses; agent concludes** |
-| baseline / went-silent signal | none (single window) | **in-window baseline, no history needed** |
-| secrets | shipped to their SaaS, then redacted | **redacted at the boundary; raw never leaves** |
-| model in the path | their fine-tuned model (a weaker bottleneck) | **none — your frontier agent reasons** |
-| our cost to run (COGS) | GPU + ingest + storage, scales w/ users | **$0 — runs on the user's box** |
+That 690 times figure is a best case on generated logs. On real service logs, expect the
+summary to be about 40 to 56 times smaller than the input. On output where almost every
+line is different, such as terminal dumps, there is little to collapse, so the ratio drops
+to about 5 times, and probe tells you when that happens.
 
----
+## probe compared to the alternatives
 
-## Benchmarked on real data + ported to Rust
+| | send raw logs to the model | hosted log-compression service | probe |
+|---|---|---|---|
+| where your logs go | to the model provider | to the service provider, then redacted | they stay on your machine |
+| logs after the summary | not kept | discarded | kept and searchable |
+| can the agent check a claim against the original lines | only if they fit | no | yes |
+| works with no log history | yes | varies | yes |
+| secrets | sent, then trusted to be redacted | sent, then redacted | removed before anything leaves |
+| cost to run | high per request | a subscription that grows with use | nothing beyond the agent you already pay for |
 
-**Grouping — real LogHub-2k, 14 oracle-labeled systems** (`python3 -m bench.grouping`):
+## Security and privacy
 
-| metric | probe | Codag `drain` | Codag `drain3` |
-|---|---:|---:|---:|
-| GA | **0.783** | 0.770 | 0.770 |
-| FTA | **0.434** | 0.297 | 0.186 |
-| purity | 0.977 | 0.978 | 0.978 |
+- Logs stay on your machine. The only thing that can leave is the summary your agent
+  chooses to send to its model, and secrets are removed from it first.
+- probe removes common secrets before they can reach a model: passwords, API keys, cloud
+  keys, tokens, private keys, credit card numbers (checked against the standard card
+  checksum), social security numbers, and authorization headers. It keeps identifiers
+  like request ids and commit hashes so that search still works. It errs toward removing
+  too much rather than too little.
+- The saved copy on disk is private to you. The cache folder and every file in it are
+  created so that only your user account can read them, so other users on a shared machine
+  cannot read your logs.
+- A capture id is checked before any file path is built, so a crafted id cannot reach
+  files outside the cache folder.
+- Every time probe opens a saved capture, it checks the capture against its recorded
+  fingerprint. A capture that was changed or damaged is refused rather than used.
+- The summary marks log content as data, not instructions, so an agent reading it is less
+  likely to act on text that an attacker planted in the logs.
+- Honest limit: these protections cover other users on the same machine, accidental
+  corruption, and tampering on disk. They do not stop software running as your own account
+  or as an administrator, which can change both the data and its fingerprint. No tool that
+  runs only on your machine can prevent that. Pair probe with the usual operating system
+  controls for that case.
 
-We match the Drain plateau on grouping (GA/purity) and beat their template
-rendering (FTA) on real labeled logs. (FGA trails on Proxifier/Spark — Drain's
-known-hard systems.)
+All of this is checked automatically by `probe selftest` and by the test suite for the
+optional Rust build.
 
-**Diagnosis under a fixed budget** (`python3 -m bench.diagnosis`, gold-evidence recall):
+## How probe is built
 
-| window | capsule | raw (trunc 20k tok) | frequency-only |
-|---|---:|---:|---:|
-| small (300) | 1.00 | 1.00 | 0.00 |
-| large (100k) | **1.00** | 0.00 | 0.00 |
+probe is written in Python and uses only the standard library, so there is nothing to
+install beyond Python itself. The part that does the heavy reading also has an optional
+build in Rust that produces the same files and runs the same work several times faster.
+probe uses the Rust build when it is present and falls back to Python otherwise.
 
-Codag's crossover, reproduced: raw wins only when it fits; at scale it truncates and
-loses the cause; frequency surfaces the loud symptom; the scored capsule keeps the
-root cause every time. Calibration (`bench.calibrate`) puts the true root cause as the
-**#1 fact (MRR 1.000)**.
+The saved copy on disk keeps every original line. It records the repeating shape of each
+line once and stores only what changes between lines, which makes it smaller than a plain
+compressed file while still letting probe read any single part without unpacking the whole
+thing. On the generated test it is about 34 times smaller at 100,000 lines and about 114
+times smaller at 1.2 million lines, against about 17 times for a plain compressed copy. On
+real logs the ratio is lower, and the figures here are reported as best cases on generated
+data.
 
-**Rust accelerator** (`rs/`, wired into the CLI): all **7 invariants** pass; it writes the *same
-typed store* the Python `Loader` reads — **cross-language lossless, verified** (a Rust-built
-capture decodes byte-for-byte in Python, and `search`/`verify`/MCP work on it). `probe build/wrap`
-**auto-use it** when `probe-rs` is on PATH (or `PROBE_RS_BIN` is set), falling back to Python
-otherwise (`--engine py|rust|auto`). **1.2M lines: 8.9 s (Python) → 2.4 s (Rust) end-to-end via
-the CLI (~3.8×)**; `install.sh` builds it automatically when cargo is present.
+On a public collection of real-world logs, probe groups similar lines about as accurately
+as widely used methods and labels them more precisely.
 
-**Cross-service + change providers** (`bin/probe multitest`): `build_multi` merges
-services' streams by timestamp; `trace <id>` stitches a request across services (root
-cause in `db`, symptom in `api`); `git log` / k8s events attach as capsule `changes`.
-
-**Capture — CLP-style lossless, seekable, TYPED store** (`probe/clp.py`): logtype dictionary +
-timestamp column + variables, where integer variable slots are stored as **zig-zag delta varints**
-(binary) — which a generic compressor can't reproduce from ASCII digits. Byte-for-byte **lossless**
-(a selftest invariant) and **seekable**: **34.4× at 100k, 114.8× at 1.2M** (vs whole-file gzip 17.5×),
-and a random `context` lookup decodes **1 of 74 blocks in ~11 ms** instead of decompressing the file.
-Head-to-head (`bench.clp_typed`) the typed encoding beats the text-columnar store by **+21–26%**,
-losslessly; on real LogHub (28k lines) it's 13.2× vs gzip's 10.0× (synthetic inflates the ratio).
-
-## Commands
+## Reproduce the numbers
 
 ```bash
-bin/probe selftest                          # invariant suite + demo
-PYTHONPATH=. python3 -m bench.grouping      # real LogHub grouping vs Codag's numbers
-PYTHONPATH=. python3 -m bench.diagnosis     # capsule vs raw vs frequency-only
-PYTHONPATH=. python3 -m bench.calibrate     # EvidenceScore weight search
-PYTHONPATH=. python3 -m bench.clp_typed     # typed binary store vs gzip-columns (ratio + lossless)
-bin/probe multitest                         # cross-service stitch + git change provider
-bin/probe multi api=api.log db=db.log --repo .   # cross-service capsule + git changes
-# Rust:
-source ~/.cargo/env && CARGO_TARGET_DIR=/tmp/probe-rs-target \
-  cargo build --release --manifest-path rs/Cargo.toml
-/tmp/probe-rs-target/release/probe-rs bench --lines 1200000
+probe selftest                            # the checks and the demo above
+PYTHONPATH=. python3 -m bench.grouping     # grouping accuracy on a public log set
+PYTHONPATH=. python3 -m bench.diagnosis    # the summary against raw logs and against plain counts
 ```
 
-## Security & honest limits
+## Frequently asked questions
 
-- **Redaction is a security boundary** (the capsule goes to a cloud LLM). It catches
-  real-format secrets — `db_password`/`client_secret`/`access_token` (keyword glued
-  after a prefix), API/cloud keys, JWT, PEM, **credit cards (Luhn)**, SSNs, and auth
-  headers incl. the credential after a scheme — while **preserving UUIDs / hex SHAs /
-  numeric IDs** so `trace` keeps working. It's heuristic and errs toward over-redaction
-  (e.g. it'll mask `author=`); tune as needed. Set **`PROBE_LOG_DIR`** to restrict which
-  files the MCP `build` tool may read. These cases are now in `selftest`
-  (`redaction_adversarial`, `bounded_worstcase`, `drilldown_capped`, `redos_safe`) so
-  they can't regress — in both Python and Rust.
-- **Realistic compression: ~40–56× on structured service logs, down to ~5× on
-  high-cardinality stdout/terminal dumps** (near one template per line — nothing to
-  collapse; `stats.low_repetition` flags this). The **690× headline is synthetic
-  best-case**; expect 40–56× on real logs.
-- **`bounded` holds on the worst case** (many distinct error templates): reserves are
-  capped and a hard `budget×1.5` ceiling trims lowest-score facts, surfacing
-  `stats.truncated_templates` (dropped templates stay in raw + index, fully retrievable).
+**Does probe send my logs to the cloud?**
+No. probe runs on your machine. The only thing that can leave is the short summary, and
+only when your agent decides to send it to its model. Secrets are removed from that
+summary first.
 
-## Remaining roadmap
+**Does it need an API key or a logged-in account?**
+No. probe does not call any model and does not need an account. Your AI agent is what talks
+to a model, using whatever access you already have.
 
-- Capture is a **typed, lossless, seekable CLP-style store in both Python and Rust**
-  (byte-compatible — either engine's capture is readable by the other): integer variables as
-  zig-zag delta varints — **34.4× @100k, 114.8× @1.2M**, beating gzip + the text store.
-  Remaining toward CLP's ~169×: delta-timestamp encoding + binary float typing, validated on
-  real high-cardinality production logs (synthetic inflates the ratio; real LogHub here is 13.2×).
-- `bench.diagnosis --llm` is wired for a **real blind diagnose + judge** (auto-detects
-  Anthropic / OpenAI / a logged-in `claude` CLI; deterministic fallback). A frontier-model
-  spot-check (N=2) scored **capsule 1.00 vs truncated-raw 0.00 vs frequency-only 0.00** at
-  scale; the automated 80-incident run just needs an API key in the environment.
-- Wire the gated real-time k8s event provider (`changes.k8s_changes`).
+**Which models does it work with?**
+Any of them. probe produces plain text. The reasoning is done by whatever agent or model
+you use.
 
-MIT-spirited; build on it.
+**How much does it cost to run?**
+Nothing beyond the agent you already pay for. There is no server and no per-use charge. The
+work happens on your computer.
+
+**What log formats does it accept?**
+Plain text logs, from a file or from a command's output. It does not need a fixed format.
+It learns the repeating shapes from the file itself.
+
+**Does it lose any log lines?**
+No. The summary is short, but the full logs are kept on disk and stay searchable. Any fact
+in the summary can be traced back to the original lines.
+
+**Can I use it without an AI agent?**
+Yes. The command line tools (`build`, `search`, `context`, `trace`, `verify`) work on their
+own.
+
+## License
+
+MIT. See [LICENSE](LICENSE). You are free to use, change, and build on it.

@@ -142,9 +142,11 @@ def cmd_wrap(pos, fl):
         print("usage: probe wrap -- <command...>", file=sys.stderr)
         sys.exit(2)
     proc = subprocess.run(cmdv, capture_output=True, text=True)
-    tmp = os.path.join(tempfile.gettempdir(), "probe_wrap_%d.log" % os.getpid())
+    # mkstemp: unpredictable name, O_EXCL|O_CREAT, mode 0600 — no symlink/TOCTOU race in
+    # the shared temp dir, and the wrapped output (may contain secrets) isn't world-readable.
+    fd, tmp = tempfile.mkstemp(prefix="probe_wrap_", suffix=".log")
     try:
-        with open(tmp, "w") as f:
+        with os.fdopen(fd, "w") as f:
             f.write(proc.stdout + proc.stderr)
         cap, h, eng = _build_file(tmp, int(fl.get("budget", 2000)), None, fl.get("engine", "auto"))
     finally:
@@ -187,7 +189,8 @@ def cmd_gen(pos, fl):
 def cmd_selftest(pos, fl):
     n = int(fl.get("lines", 100000))
     budget = int(fl.get("budget", 2000))
-    log = os.path.join(tempfile.gettempdir(), "probe_selftest.log")
+    fd, log = tempfile.mkstemp(prefix="probe_selftest_", suffix=".log")  # unpredictable name: no symlink clobber
+    os.close(fd)
     gen.generate(n, log)
     raw = open(log, "rb").read()
 
@@ -256,6 +259,33 @@ def cmd_selftest(pos, fl):
     redact.redact(("-----BEGIN PRIVATE KEY-----\n" * 3000) + ("x" * 60 + "\n") * 100)
     redos_ms = (time.time() - t) * 1000
     chk("redos_safe", redos_ms < 1000, "PEM-flood redaction in %.0f ms (<1000)" % redos_ms)
+
+    # --- security boundary: traversal rejected, integrity enforced, cache locked, injection-labeled ---
+    sec = []
+    for bad in ["../../etc/passwd", "/etc/passwd", "ABCDEF0123456789", h + "x", "../" * 4 + "tmp"]:
+        try:
+            engine.Loader(bad); sec.append("traversal accepted: %r" % bad)
+        except ValueError:
+            pass
+    _sd = tempfile.mkdtemp(prefix="probe_sec_")
+    try:
+        _h = engine.build(raw[:20000] + b"\nERROR sentinel boom\n", budget_tokens=300, cache_dir=_sd)[1]
+        _sp = os.path.join(_sd, "captures", _h, "store.clp")
+        _b = bytearray(open(_sp, "rb").read()); _b[-2] ^= 0x40; open(_sp, "wb").write(bytes(_b))
+        try:
+            engine.Loader(_h, cache_dir=_sd); sec.append("store tamper not detected")
+        except ValueError:
+            pass
+    finally:
+        shutil.rmtree(_sd, ignore_errors=True)
+    if os.name == "posix":
+        for _p in (ld.dir, os.path.join(ld.dir, "store.clp"), os.path.join(ld.dir, "meta.json")):
+            if _stat.S_IMODE(os.stat(_p).st_mode) & 0o077:
+                sec.append("group/other-accessible: %s" % os.path.basename(_p))
+    if "_provenance" not in cap:
+        sec.append("missing prompt-injection note")
+    chk("security_boundary", not sec,
+        "traversal rejected, store-tamper detected, cache 0700/0600, injection-labeled" if not sec else "; ".join(sec))
 
     print("=" * 64)
     print("  probe selftest  (%s lines, budget %d tokens)" % (f"{n:,}", budget))
