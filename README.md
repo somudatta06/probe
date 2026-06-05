@@ -82,6 +82,8 @@ probe search  <capture_id> --level ERROR --limit 20
 probe context <capture_id> 85004 --before 5 --after 10
 probe trace   <capture_id> <request_id>
 probe verify  <capture_id> F12         # re-derive a fact from the original lines
+
+probe savings                          # estimated money saved so far vs sending raw logs
 ```
 
 You can also wrap any command your agent already runs and capture its output:
@@ -105,9 +107,9 @@ Claude Code and Cursor, can call it directly. Add this to your MCP config:
 }
 ```
 
-The agent gets these tools: `build`, `capsule`, `search`, `context`, `trace`, `verify`.
-It reads the short summary first, then pulls more as its questions require. No model runs
-inside probe. Your agent does the reasoning.
+The agent gets these tools: `build`, `capsule`, `search`, `context`, `trace`, `verify`, and
+`savings`. It reads the short summary first, then pulls more as its questions require. No
+model runs inside probe. Your agent does the reasoning.
 
 ## What you get
 
@@ -118,14 +120,15 @@ heartbeat that goes quiet):
 | measure | value |
 |---|---|
 | input | 1,200,000 lines |
-| summary | about 1,740 tokens (the units a model is billed by) |
+| summary | about 1,900 tokens (the units a model is billed by) |
 | build time | 8.8 seconds in Python on one core, under one second with the optional Rust build |
-| cost to send the summary to a model | about half a cent, against roughly twenty dollars for the raw logs |
+| cost to send the summary to a model | about half a cent, against about forty-five dollars for the raw logs (estimated at $3 per million tokens) |
 
-That 690 times figure is a best case on generated logs. On real service logs, expect the
-summary to be about 40 to 56 times smaller than the input. On output where almost every
-line is different, such as terminal dumps, there is little to collapse, so the ratio drops
-to about 5 times, and probe tells you when that happens.
+probe also keeps a running tally of this saving across your captures, which you can read
+with `probe savings`. That 600 times figure is a best case on generated logs. On real
+service logs, expect the summary to be about 40 to 56 times smaller than the input. On
+output where almost every line is different, such as terminal dumps, there is little to
+collapse, so the ratio drops to about 5 times, and probe tells you when that happens.
 
 ## probe compared to the alternatives
 

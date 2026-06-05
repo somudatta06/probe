@@ -83,6 +83,54 @@ def _chmod(path, mode):
         pass
 
 
+DEFAULT_PRICE_PER_MTOK = 3.0  # USD per 1M input tokens; a mid-range default (Claude Sonnet input)
+
+
+def _price(price_per_mtok=None):
+    try:
+        return float(price_per_mtok if price_per_mtok is not None
+                     else os.environ.get("PROBE_PRICE_PER_MTOK", DEFAULT_PRICE_PER_MTOK))
+    except (TypeError, ValueError):
+        return DEFAULT_PRICE_PER_MTOK
+
+
+def _cost(raw_bytes, capsule_tokens):
+    # Estimated saving from sending the short summary instead of the raw logs, using the
+    # common rough rule of about 4 bytes per token. Deterministic (fixed default price),
+    # so it can live inside the capsule without breaking the same-bytes-same-capsule rule.
+    capsule_tokens = int(capsule_tokens)
+    raw_tokens = max(capsule_tokens, len(raw_bytes) // 4)
+    saved = raw_tokens - capsule_tokens
+    return {"raw_tokens": raw_tokens, "capsule_tokens": capsule_tokens, "saved_tokens": saved,
+            "saved_usd": round(saved / 1e6 * DEFAULT_PRICE_PER_MTOK, 6),
+            "price_per_mtok": DEFAULT_PRICE_PER_MTOK, "estimate": True}
+
+
+def savings_summary(cache_dir=None, price_per_mtok=None):
+    """Add up the estimated savings recorded in every capsule in the cache. Reads the
+    capsules directly (not through Loader) so one damaged capture cannot break the tally."""
+    capdir = os.path.join(cache_dir or _cache_dir(), "captures")
+    n = saved_tokens = raw_tokens = cap_tokens = 0
+    if os.path.isdir(capdir):
+        for cid in os.listdir(capdir):
+            try:
+                with open(os.path.join(capdir, cid, "capsule.json")) as f:
+                    cost = json.load(f).get("stats", {}).get("cost")
+            except (OSError, ValueError):
+                continue
+            if not cost:
+                continue
+            n += 1
+            saved_tokens += cost.get("saved_tokens", 0)
+            raw_tokens += cost.get("raw_tokens", 0)
+            cap_tokens += cost.get("capsule_tokens", 0)
+    price = _price(price_per_mtok)
+    return {"captures": n, "saved_tokens": saved_tokens, "raw_tokens": raw_tokens,
+            "capsule_tokens": cap_tokens, "saved_usd": round(saved_tokens / 1e6 * price, 4),
+            "price_per_mtok": price, "estimate": True,
+            "note": "estimated saving vs sending the raw logs to a model at $%g per million tokens" % price}
+
+
 # ----------------------------------------------------------------------------- multiline records
 def to_records(raw_lines, service=""):
     """Group physical lines into logical records (start line + its continuation
@@ -320,7 +368,8 @@ def _finalize(records, clusters, facts, tok, truncated, anchor, n_lines, n_rec,
         "stats": {"templates": len(clusters), "input_lines": n_lines, "records": n_rec,
                   "capsule_tokens": tok, "truncated_templates": truncated,
                   "compression_x": round(n_lines / max(1, tok), 1),
-                  "low_repetition": n_rec > 100 and len(clusters) > 0.5 * n_rec},
+                  "low_repetition": n_rec > 100 and len(clusters) > 0.5 * n_rec,
+                  "cost": _cost(raw_bytes, tok)},
     }
 
     traces_index = defaultdict(list)

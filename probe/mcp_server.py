@@ -53,6 +53,9 @@ TOOLS = [
      "description": "Re-derive a fact's count from raw evidence + return sample raw lines. Proves the capsule did not invent it.",
      "inputSchema": {"type": "object", "properties": {
          "capture_id": {"type": "string"}, "fact_id": {"type": "string"}}, "required": ["capture_id", "fact_id"]}},
+    {"name": "savings",
+     "description": "Estimated model-cost saving so far: how much sending probe's short summaries saved versus sending the raw logs, totaled across all captures. Returns saved USD and tokens.",
+     "inputSchema": {"type": "object", "properties": {}}},
 ]
 
 
@@ -73,6 +76,8 @@ def _call(name, a):
         from . import cli  # reuse the Rust-accelerated build path (Python fallback)
         cap, _h, _eng = cli._build_file(_build_path(a["path"]), int(a.get("budget_tokens", 2000)))
         return cap
+    if name == "savings":
+        return engine.savings_summary()
     if name not in _TOOL_NAMES:
         raise ValueError("unknown tool: %s" % name)
     ld = _loader(a["capture_id"])
