@@ -4,10 +4,10 @@
 
 **Logs your AI agent can investigate, not just read.**
 
-![License](https://img.shields.io/github/license/somudatta06/probe)
+![License](https://img.shields.io/badge/license-MIT-green.svg)
 ![Python](https://img.shields.io/badge/python-3.8%2B-blue.svg)
 ![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen.svg)
-![Release](https://img.shields.io/github/v/release/somudatta06/probe?sort=semver)
+![Release](https://img.shields.io/badge/release-v0.1.0-blue.svg)
 
 [Install](#install) · [Quickstart](#quickstart) · [How it works](#how-it-works) · [Use it with an AI agent](#use-it-with-an-ai-agent) · [Security](#security-and-privacy) · [FAQ](#faq)
 
