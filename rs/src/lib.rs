@@ -726,6 +726,20 @@ fn build_inner(
     stats.insert("truncated_templates".into(), json!(truncated));
     stats.insert("compression_x".into(), json!(compression_x));
 
+    // Estimated saving from sending the short summary instead of the raw logs (about 4
+    // bytes per token, a fixed mid-range price). Matches probe/engine.py _cost.
+    let price = 3.0_f64;
+    let raw_tokens = std::cmp::max(tok, raw_bytes.len() / 4);
+    let saved = raw_tokens - tok;
+    let mut cost = Map::new();
+    cost.insert("raw_tokens".into(), json!(raw_tokens));
+    cost.insert("capsule_tokens".into(), json!(tok));
+    cost.insert("saved_tokens".into(), json!(saved));
+    cost.insert("saved_usd".into(), json!(((saved as f64 / 1e6 * price) * 1e6).round() / 1e6));
+    cost.insert("price_per_mtok".into(), json!(price));
+    cost.insert("estimate".into(), json!(true));
+    stats.insert("cost".into(), Value::Object(cost));
+
     let mut capsule = Map::new();
     capsule.insert("schema".into(), json!("probe.capsule/v0"));
     capsule.insert("window".into(), Value::Object(window));

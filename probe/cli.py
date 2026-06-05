@@ -181,6 +181,15 @@ def cmd_verify(pos, fl):
     _p(engine.Loader(pos[0]).verify(pos[1]))
 
 
+def cmd_savings(pos, fl):
+    s = engine.savings_summary(price_per_mtok=fl.get("price"))
+    _p(s)
+    print("\nprobe has saved an estimated $%.2f across %d captures, by sending short summaries "
+          "instead of the raw logs\n(assumes a model at $%g per million tokens; set --price or "
+          "PROBE_PRICE_PER_MTOK to change)."
+          % (s["saved_usd"], s["captures"], s["price_per_mtok"]), file=sys.stderr)
+
+
 def cmd_gen(pos, fl):
     n = gen.generate(int(fl.get("lines", 100000)), pos[0])
     print("wrote %d lines -> %s" % (n, pos[0]))
@@ -287,6 +296,13 @@ def cmd_selftest(pos, fl):
     chk("security_boundary", not sec,
         "traversal rejected, store-tamper detected, cache 0700/0600, injection-labeled" if not sec else "; ".join(sec))
 
+    cost = cap["stats"].get("cost")
+    sv = engine.savings_summary()
+    price_ok = bool(cost) and cost["raw_tokens"] >= cost["capsule_tokens"] and cost["saved_tokens"] >= 0 \
+        and sv["captures"] >= 1 and sv["saved_usd"] >= 0
+    chk("price_log", price_ok, "this build saved ~$%.4f; cache total ~$%.2f across %d captures"
+        % ((cost or {}).get("saved_usd", 0), sv["saved_usd"], sv["captures"]))
+
     print("=" * 64)
     print("  probe selftest  (%s lines, budget %d tokens)" % (f"{n:,}", budget))
     print("=" * 64)
@@ -306,8 +322,10 @@ def cmd_selftest(pos, fl):
     print("  CLP store .......... %.0f KB lossless+seekable (%.1fx) vs whole-file gzip %.0f KB (%.1fx)"
           % (store_b / 1024, len(raw) / store_b, gz_b / 1024, len(raw) / gz_b))
     print("  build time ......... %.0f ms  (no model, no GPU, 1 core)" % build_ms)
-    print("  capsule cost @ Sonnet in($3/M) .. $%.5f  vs raw ~$%.2f"
-          % (st["capsule_tokens"] / 1e6 * 3, st["input_lines"] * 6 / 1e6 * 3))
+    _c = st["cost"]
+    print("  capsule cost @ $%g/M tokens .. $%.5f  vs raw ~$%.2f  (estimated saving $%.2f)"
+          % (_c["price_per_mtok"], _c["capsule_tokens"] / 1e6 * _c["price_per_mtok"],
+             _c["raw_tokens"] / 1e6 * _c["price_per_mtok"], _c["saved_usd"]))
     print("-" * 64)
     if cap["hypotheses"]:
         print("  hypothesis (labeled, not asserted):")
@@ -327,8 +345,9 @@ def cmd_mcp(pos, fl):
 
 _CMDS = {
     "build": cmd_build, "wrap": cmd_wrap, "capsule": cmd_capsule, "search": cmd_search,
-    "context": cmd_context, "trace": cmd_trace, "verify": cmd_verify, "gen": cmd_gen,
-    "multi": cmd_multi, "multitest": cmd_multitest, "selftest": cmd_selftest, "mcp": cmd_mcp,
+    "context": cmd_context, "trace": cmd_trace, "verify": cmd_verify, "savings": cmd_savings,
+    "gen": cmd_gen, "multi": cmd_multi, "multitest": cmd_multitest, "selftest": cmd_selftest,
+    "mcp": cmd_mcp,
 }
 
 
