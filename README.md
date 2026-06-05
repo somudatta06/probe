@@ -1,39 +1,73 @@
-# probe
+<div align="center">
 
-![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)
-![Python](https://img.shields.io/badge/python-3.8%2B-blue.svg)
-![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen.svg)
+# probe
 
 **Logs your AI agent can investigate, not just read.**
 
-probe turns large log files into a short, ranked summary your AI agent can read,
-then lets the agent search the full logs on demand. It runs on your own machine.
-It removes secrets before anything is sent to a model. There is no server to run
-and no per-use cost.
+![License](https://img.shields.io/github/license/somudatta06/probe)
+![Python](https://img.shields.io/badge/python-3.8%2B-blue.svg)
+![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen.svg)
+![Release](https://img.shields.io/github/v/release/somudatta06/probe?sort=semver)
+
+[Install](#install) · [Quickstart](#quickstart) · [How it works](#how-it-works) · [Use it with an AI agent](#use-it-with-an-ai-agent) · [Security](#security-and-privacy) · [FAQ](#faq)
+
+</div>
+
+probe turns large log files into a short, ranked summary your AI agent can read, then lets
+the agent search the full logs on demand. It runs on your own machine. It removes secrets
+before anything is sent to a model. There is no server to run and no per-use cost.
+
+Here is what an agent gets back from one run, on an incident buried in over a million
+routine lines (example output from `probe selftest`):
+
+```text
+EVIDENCE  (ranked by relevance)
+  F12  0.95  ERROR  psycopg2.OperationalError: could not connect to server   new, near the incident, shares a request id, has a traceback
+  F14  0.95  ERROR  retry 1/3 db_users id=abc124                             new, near the incident, shares a request id
+  F15  0.95  ERROR  pool exhausted, queue=18 id=abc125                       new, near the incident, shares a request id
+  F18  0.89  ERROR  upstream timeout id=abc294  (seen 2,570 times)           new, near the incident, shares a request id
+  F11  0.80  WARN   pool acquire 240ms                                       just before the incident
+  F9   0.49  INFO   heartbeat ok seq=...  (seen 169 times, then stopped)     a routine signal that went quiet
+
+CHANGES     a deploy went out near the incident: sha 9f2c3a1, service db, version v2.3.1
+HYPOTHESIS  the database errors began near line 1,020,004, around the deploy and just after
+            the heartbeat went quiet. Marked a guess that rests on F12 and F9, for the agent to confirm.
+ROUTINE     69,000 routine lines collapsed into 3 counts
+```
+
+Each fact (F12, F14, and so on) expands back to the exact raw lines with one command, so the
+agent can confirm anything instead of trusting it.
+
+## Why probe
+
+- **Your logs stay put.** probe runs locally. Only the short summary can go to a model, and secrets are removed from it first.
+- **Nothing is thrown away.** The full logs are kept on disk and stay searchable. Every fact traces back to the original lines.
+- **It finds the needle.** It ranks the lines most likely to explain the problem, so the cause survives even when the logs are far too big to send.
+- **It works with your agent.** It plugs into tools that support the Model Context Protocol, such as Claude Code and Cursor.
+- **You can see what you save.** probe estimates the model cost it avoids on each run and keeps a running total.
+- **No setup tax.** One command to install, no runtime dependencies, no account, no server.
 
 ## The problem
 
-When something breaks, the logs that explain it are often too large to send to a
-language model. A million log lines can cost more than twenty dollars to send to a
-large model in one request, and most of those lines are routine. If you cut the logs
-down to fit, you usually remove the few lines that actually matter.
+When something breaks, the logs that explain it are usually too large to fit in a model's
+context window. A million log lines is tens of millions of tokens, far more than fits in one
+request. So you cut the logs down to size, and that is exactly when you tend to drop the few
+lines that matter. Whatever you do send, you also pay for, mostly to ship routine noise.
 
 ## What probe does
 
 probe reads the logs once and produces two things:
 
-1. A short summary, which we call the capsule. It holds the log lines most likely to
-   explain the incident, ranked by how relevant they are, with routine messages
-   collapsed into counts. It is small enough to send to a model at low cost.
-2. A full, searchable copy of the logs on disk. Nothing is thrown away. The agent can
-   search it, read the lines around any event, follow a single request across services,
-   and re-check any claim against the original lines.
+1. A short summary, which we call the capsule. It holds the log lines most likely to explain
+   the incident, ranked by how relevant they are, with routine messages collapsed into
+   counts. It is small enough to send to a model at low cost.
+2. A full, searchable copy of the logs on disk. Nothing is thrown away. The agent can search
+   it, read the lines around any event, follow a single request across services, and
+   re-check any claim against the original lines.
 
-The agent reads the summary first, then asks for more only where its question leads.
-Every number in the summary can be traced back to real log lines.
-
-probe does not guess a root cause for you. It surfaces ranked facts and clearly labeled
-guesses, and leaves the conclusion to the agent or to you.
+The agent reads the summary first, then asks for more only where its question leads. probe
+does not guess a root cause for you. It surfaces ranked facts and clearly labeled guesses,
+and leaves the conclusion to the agent or to you.
 
 ## Who it is for
 
@@ -41,10 +75,9 @@ Anyone whose AI agent needs to read logs:
 
 - On-call engineers and site reliability engineers working through an incident.
 - Security and platform teams that cannot send raw logs to an outside service.
-- Teams in finance, healthcare, and government, where logs have to stay on their own
-  machines.
-- Anyone using an AI coding agent such as Claude Code or Cursor who wants it to read
-  real production logs without a large bill.
+- Teams in finance, healthcare, and government, where logs have to stay on their own machines.
+- Anyone using an AI coding agent such as Claude Code or Cursor who wants it to read real
+  production logs without a large bill.
 
 ## How it works
 
@@ -52,8 +85,8 @@ A single pass over the log file does all of the following:
 
 1. Groups lines that belong together, so a stack trace stays as one record.
 2. Finds the repeating shape of each line, so routine messages collapse into counts.
-3. Compares each kind of line against the rest of the same file, so probe can flag what
-   is new, what stopped happening, and what changed rate. This needs no prior history.
+3. Compares each kind of line against the rest of the same file, so probe can flag what is
+   new, what stopped happening, and what changed rate. This needs no prior history.
 4. Ranks lines by how likely they are to explain the incident.
 5. Removes secrets.
 6. Saves a full, searchable copy on disk.
@@ -64,6 +97,8 @@ almost no extra work.
 ## Install
 
 ```bash
+git clone https://github.com/somudatta06/probe.git
+cd probe
 ./install.sh
 ```
 
@@ -94,10 +129,10 @@ probe wrap -- journalctl -u api --since "1 hour ago"
 probe wrap -- docker compose logs api
 ```
 
-## Use it with an AI agent (Model Context Protocol)
+## Use it with an AI agent
 
-probe speaks the Model Context Protocol (MCP), so agents that support MCP, such as
-Claude Code and Cursor, can call it directly. Add this to your MCP config:
+probe speaks the Model Context Protocol (MCP), so agents that support MCP, such as Claude
+Code and Cursor, can call it directly. Add this to your MCP config:
 
 ```json
 {
@@ -124,11 +159,11 @@ heartbeat that goes quiet):
 | build time | 8.8 seconds in Python on one core, under one second with the optional Rust build |
 | cost to send the summary to a model | about half a cent, against about forty-five dollars for the raw logs (estimated at $3 per million tokens) |
 
-probe also keeps a running tally of this saving across your captures, which you can read
-with `probe savings`. That 600 times figure is a best case on generated logs. On real
-service logs, expect the summary to be about 40 to 56 times smaller than the input. On
-output where almost every line is different, such as terminal dumps, there is little to
-collapse, so the ratio drops to about 5 times, and probe tells you when that happens.
+probe keeps a running tally of this saving across your captures, which you can read with
+`probe savings`. That 600 times figure is a best case on generated logs. On real service
+logs, expect the summary to be about 40 to 56 times smaller than the input. On output where
+almost every line is different, such as terminal dumps, there is little to collapse, so the
+ratio drops to about 5 times, and probe tells you when that happens.
 
 ## probe compared to the alternatives
 
@@ -143,18 +178,18 @@ collapse, so the ratio drops to about 5 times, and probe tells you when that hap
 
 ## Security and privacy
 
-- Logs stay on your machine. The only thing that can leave is the summary your agent
-  chooses to send to its model, and secrets are removed from it first.
+- Logs stay on your machine. The only thing that can leave is the summary your agent chooses
+  to send to its model, and secrets are removed from it first.
 - probe removes common secrets before they can reach a model: passwords, API keys, cloud
   keys, tokens, private keys, credit card numbers (checked against the standard card
-  checksum), social security numbers, and authorization headers. It keeps identifiers
-  like request ids and commit hashes so that search still works. It errs toward removing
-  too much rather than too little.
+  checksum), social security numbers, and authorization headers. It keeps identifiers like
+  request ids and commit hashes so that search still works. It errs toward removing too much
+  rather than too little.
 - The saved copy on disk is private to you. The cache folder and every file in it are
   created so that only your user account can read them, so other users on a shared machine
   cannot read your logs.
-- A capture id is checked before any file path is built, so a crafted id cannot reach
-  files outside the cache folder.
+- A capture id is checked before any file path is built, so a crafted id cannot reach files
+  outside the cache folder.
 - Every time probe opens a saved capture, it checks the capture against its recorded
   fingerprint. A capture that was changed or damaged is refused rather than used.
 - The summary marks log content as data, not instructions, so an agent reading it is less
@@ -171,20 +206,20 @@ optional Rust build.
 ## How probe is built
 
 probe is written in Python and uses only the standard library, so there is nothing to
-install beyond Python itself. The part that does the heavy reading also has an optional
-build in Rust that produces the same files and runs the same work several times faster.
-probe uses the Rust build when it is present and falls back to Python otherwise.
+install beyond Python itself. The part that does the heavy reading also has an optional build
+in Rust that produces the same files and runs the same work several times faster. probe uses
+the Rust build when it is present and falls back to Python otherwise.
 
-The saved copy on disk keeps every original line. It records the repeating shape of each
-line once and stores only what changes between lines, which makes it smaller than a plain
+The saved copy on disk keeps every original line. It records the repeating shape of each line
+once and stores only what changes between lines, which makes it smaller than a plain
 compressed file while still letting probe read any single part without unpacking the whole
 thing. On the generated test it is about 34 times smaller at 100,000 lines and about 114
 times smaller at 1.2 million lines, against about 17 times for a plain compressed copy. On
 real logs the ratio is lower, and the figures here are reported as best cases on generated
 data.
 
-On a public collection of real-world logs, probe groups similar lines about as accurately
-as widely used methods and labels them more precisely.
+On a public collection of real-world logs, probe groups similar lines about as accurately as
+widely used methods and labels them more precisely.
 
 ## Reproduce the numbers
 
@@ -194,36 +229,35 @@ PYTHONPATH=. python3 -m bench.grouping     # grouping accuracy on a public log s
 PYTHONPATH=. python3 -m bench.diagnosis    # the summary against raw logs and against plain counts
 ```
 
-## Frequently asked questions
+## FAQ
 
 **Does probe send my logs to the cloud?**
-No. probe runs on your machine. The only thing that can leave is the short summary, and
-only when your agent decides to send it to its model. Secrets are removed from that
-summary first.
+No. probe runs on your machine. The only thing that can leave is the short summary, and only
+when your agent decides to send it to its model. Secrets are removed from that summary first.
 
 **Does it need an API key or a logged-in account?**
-No. probe does not call any model and does not need an account. Your AI agent is what talks
-to a model, using whatever access you already have.
+No. probe does not call any model and does not need an account. Your AI agent is what talks to
+a model, using whatever access you already have.
 
 **Which models does it work with?**
-Any of them. probe produces plain text. The reasoning is done by whatever agent or model
-you use.
+Any of them. probe produces plain text. The reasoning is done by whatever agent or model you
+use.
 
 **How much does it cost to run?**
 Nothing beyond the agent you already pay for. There is no server and no per-use charge. The
 work happens on your computer.
 
 **What log formats does it accept?**
-Plain text logs, from a file or from a command's output. It does not need a fixed format.
-It learns the repeating shapes from the file itself.
+Plain text logs, from a file or from a command's output. It does not need a fixed format. It
+learns the repeating shapes from the file itself.
 
 **Does it lose any log lines?**
-No. The summary is short, but the full logs are kept on disk and stay searchable. Any fact
-in the summary can be traced back to the original lines.
+No. The summary is short, but the full logs are kept on disk and stay searchable. Any fact in
+the summary can be traced back to the original lines.
 
 **Can I use it without an AI agent?**
-Yes. The command line tools (`build`, `search`, `context`, `trace`, `verify`) work on their
-own.
+Yes. The command line tools (`build`, `search`, `context`, `trace`, `verify`, `savings`) work
+on their own.
 
 ## License
 
