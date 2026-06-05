@@ -5,16 +5,19 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "probe-logs"
 version = "0.1.0"
-description = "Local-first incident-evidence engine for AI agents: huge logs -> a small ranked capsule + a lossless, seekable index the agent can drill into."
+description = "Turn large log files into a short, ranked summary your AI agent can read, then let it search the full logs on demand. Runs locally, removes secrets before anything reaches a model, and costs nothing to run."
 readme = "README.md"
 requires-python = ">=3.8"
-license = { text = "FSL-1.1-Apache-2.0" }
-authors = [{ name = "probe" }]
-keywords = ["logs", "observability", "incident", "mcp", "ai-agents", "sre", "clp", "drain"]
-dependencies = []  # stdlib only — zero runtime deps
+license = { text = "MIT" }
+authors = [{ name = "Somu Datta" }]
+keywords = ["logs", "log-analysis", "log-compression", "observability", "incident-response",
+            "mcp", "model-context-protocol", "ai-agents", "llm", "claude", "cursor", "sre",
+            "debugging", "redaction", "privacy", "local-first"]
+dependencies = []  # standard library only, no runtime dependencies
 
 [project.urls]
-Homepage = "https://github.com/your-org/probe"
+Homepage = "https://github.com/somudatta06/probe"
+Repository = "https://github.com/somudatta06/probe"
 
 [project.scripts]
 probe = "probe.cli:main"
